@@ -1,0 +1,111 @@
+# =========================
+#  PYTHON
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+wheels/
+
+# uv (Astral)
+.uv/
+
+# Byte-compiled / optimized / DLL files
+*.dll
+*.dylib
+
+# =========================
+# ENV / SECRETS
+# =========================
+.env
+.env.*
+!.env.example
+secrets/
+*.key
+*.pem
+*.crt
+
+# =========================
+# VIRTUAL ENVIRONMENTS
+# =========================
+.venv/
+.venv*/
+.Python
+pythonenv*
+env/
+venv/
+
+# =========================
+# DATABASE / ALEMBIC
+# =========================
+alembic/versions/*.pyc
+alembic/versions/*.py~
+alembic/versions/*__auto*.py
+# Бывает, что юзеры случайно добавляют SQLite
+*.sqlite
+*.sqlite3
+
+# =========================
+# LOGS
+# =========================
+*.log
+*.log.*
+logs/
+log/
+*.pid
+
+# =========================
+# CACHE
+# =========================
+.cache/
+.pytest_cache/
+mypy_cache/
+pip-wheel-metadata/
+__pypackages__/
+.ipynb_checkpoints/
+
+# =========================
+# DOCKER
+# =========================
+# local build artifacts
+docker-data/
+data/
+tmp/
+*.tar
+
+# =========================
+# Caddy / Nginx
+# =========================
+Caddyfile.old
+caddy/*.json
+
+# =========================
+# EDITORS / IDE
+# =========================
+.vscode/
+.vscode/*
+.idea/
+*.iml
+
+# =========================
+# OS-SPECIFIC
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# WINDOWS / YANDEX DISK SYNC
+# =========================
+*.lnk
+*.tmp
+*.temp
+$RECYCLE.BIN/
+YandexDisk/

@@ -183,25 +183,7 @@ async def init_db():
         logger.info("📊 Создание индексов для оптимизации...")
 
         async with engine.begin() as conn:
-            indexes = [
-                ("users", "CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id)")
-            ]
-
-            for table_name, index_sql in indexes:
-                table_exists = await conn.run_sync(lambda sync_conn: inspect(sync_conn).has_table(table_name))
-
-                if not table_exists:
-                    logger.debug(
-                        "Пропускаем создание индекса %s: таблица %s отсутствует",
-                        index_sql,
-                        table_name,
-                    )
-                    continue
-
-                try:
-                    await conn.execute(text(index_sql))
-                except Exception as e:
-                    logger.debug("Index creation skipped for %s: %s", table_name, e)
+            pass
 
     logger.info("✅ База данных успешно инициализирована")
 

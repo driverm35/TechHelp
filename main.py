@@ -1,7 +1,6 @@
 from __future__ import annotations
 import os
 import boto3
-import urllib.error
 import asyncio
 import contextlib
 import logging
@@ -15,6 +14,7 @@ from app.utils.cache import cache
 from app.utils.startup_timeline import StartupTimeline
 from app.utils.timezone import TimezoneAwareFormatter
 from app.web.server import create_app
+from pathlib import Path
 
 from app.db.database import init_db
 
@@ -72,10 +72,16 @@ class GracefulExit:
 
 
 async def main():
+    # === ЛОГИ ===
+    log_path = Path(settings.log_file)
+    log_dir = log_path.parent
+    log_dir.mkdir(parents=True, exist_ok=True)  # <-- добавь это
+
     formatter = TimezoneAwareFormatter(
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         timezone_name=settings.timezone,
     )
+
 
     file_handler = logging.FileHandler(settings.log_file, encoding='utf-8')
     file_handler.setFormatter(formatter)

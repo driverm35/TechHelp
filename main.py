@@ -1,4 +1,7 @@
 from __future__ import annotations
+import os
+import boto3
+import urllib.error
 import asyncio
 import contextlib
 import logging
@@ -14,6 +17,51 @@ from app.utils.timezone import TimezoneAwareFormatter
 from app.web.server import create_app
 
 from app.db.database import init_db
+
+async def check_s3_connection(logger: logging.Logger) -> None:
+    """Проверка доступности S3-бакета при старте приложения."""
+    endpoint = os.getenv('S3_ENDPOINT_URL')
+    bucket = os.getenv('S3_BUCKET_NAME')
+    region = os.getenv('S3_REGION', 'ru-1')
+    access_key = os.getenv('S3_ACCESS_KEY')
+    secret_key = os.getenv('S3_SECRET_KEY')
+
+    # Если не настроено — просто предупреждаем и выходим
+    if not all([endpoint, bucket, access_key, secret_key]):
+        logger.warning("S3 не настроен (нет части переменных окружения), пропускаем проверку")
+        return
+
+    def _sync_check():
+        s3_client = boto3.client(
+            's3',
+            endpoint_url=endpoint,
+            region_name=region,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+        )
+
+        # Проверяем доступ к бакету
+        s3_client.head_bucket(Bucket=bucket)
+
+        # Опциональный тест на запись/удаление (как в test_s3.py)
+        test_key = "test/supportbot_startup_check.txt"
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=test_key,
+            Body=b"SupportBot S3 startup test"
+        )
+        s3_client.delete_object(Bucket=bucket, Key=test_key)
+
+    # Запускаем блокирующий boto3 в отдельном потоке
+    try:
+        await asyncio.to_thread(_sync_check)
+    except Exception as e:
+        # В DEV — просто предупреждаем, в PROD можно падать
+        if settings.app_env.lower() in ("prod", "production"):
+            logger.error("❌ Проверка S3 не пройдена, останавливаем запуск: %s", e)
+            raise
+        else:
+            logger.warning("⚠️ Проверка S3 не пройдена (DEV/TEST режим): %s", e)
 
 class GracefulExit:
     def __init__(self):
@@ -73,6 +121,18 @@ async def main():
             "Инициализация базы данных", "🗄️", success_message="База данных готова"
         ):
             await init_db()
+
+        async with timeline.stage(
+            "Проверка S3 backup-хранилища", "💾", success_message="S3 доступен"
+        ):
+            await check_s3_connection(logger)
+            # Можно логировать детали
+            logger.info(
+                "S3 endpoint=%s bucket=%s region=%s",
+                os.getenv('S3_ENDPOINT_URL'),
+                os.getenv('S3_BUCKET_NAME'),
+                os.getenv('S3_REGION', 'ru-1'),
+            )
 
         async with timeline.stage("Настройка бота", "🤖", success_message="Бот настроен") as stage:
             bot, dp = await setup_bot()

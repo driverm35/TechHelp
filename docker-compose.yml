@@ -20,7 +20,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
-      - pgdata:/var/lib/postgresql/data
+    - ./pgdata:/var/lib/postgresql/data
     restart: unless-stopped
     networks: [appnet]
 
@@ -42,7 +42,24 @@ services:
       - caddy_data:/data
       - caddy_config:/config
     networks: [appnet]
-
+  backup:
+    build:
+      context: .
+      dockerfile: Dockerfile.backup
+    container_name: supportbot-backup
+    restart: unless-stopped
+    env_file: [.env]
+    volumes:
+      - ./backup_logs:/var/log
+      - ./app/backup:/backup:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "30m"
+        max-file: "5"
+    depends_on:
+      - postgres
+    networks: [appnet]
 volumes:
   pgdata:
   caddy_data:

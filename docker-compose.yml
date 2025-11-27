@@ -9,6 +9,7 @@ services:
       - redis
     volumes:
       - ./data:/app/data
+      - ./logs:/app/logs
       - ./secrets:/secrets:ro
     networks: [appnet]
 

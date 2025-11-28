@@ -576,22 +576,36 @@ async def _copy_ticket_history_to_tech(
         # 3. Копируем каждое сообщение
         for msg in messages:
             try:
-                # Формируем префикс отправителя
-                if msg.is_from_admin:
+                # Распознаём служебные/внутренние заметки по префиксу
+                text_stripped = (msg.message_text or "").lstrip()
+                is_staff_note = text_stripped.startswith("💼 ")
+                is_internal_note = text_stripped.startswith("📝 ")
+
+                # Формируем префикс отправителя только для обычных сообщений
+                if msg.is_from_admin and not (is_staff_note or is_internal_note):
                     prefix = "🛠️ <b>Поддержка:</b>\n"
-                else:
+                elif not msg.is_from_admin:
                     prefix = "👤 <b>Клиент:</b>\n"
+                else:
+                    # для служебных/внутренних заметок текста уже достаточно
+                    prefix = ""
+
+                sent_msg = None
 
                 # Если есть медиа
                 if msg.has_media and msg.media_file_id:
-                    caption = f"{prefix}{msg.media_caption or ''}" if msg.media_caption else prefix.rstrip()
+                    if prefix:
+                        base_caption = f"{prefix}{msg.media_caption or msg.message_text or ''}".strip()
+                    else:
+                        # Для служебных/внутренних — используем оригинальный текст как есть
+                        base_caption = msg.media_caption or msg.message_text or ""
 
-                    # Ограничиваем длину caption
+                    caption = base_caption
                     if len(caption) > 1000:
-                        caption = caption[:997] + "..."
+                        caption = caption[:997] + "."
 
                     if msg.media_type == "photo":
-                        await bot.send_photo(
+                        sent_msg = await bot.send_photo(
                             chat_id=tech_chat_id,
                             message_thread_id=tech_thread_id,
                             photo=msg.media_file_id,
@@ -599,7 +613,7 @@ async def _copy_ticket_history_to_tech(
                             parse_mode="HTML",
                         )
                     elif msg.media_type == "video":
-                        await bot.send_video(
+                        sent_msg = await bot.send_video(
                             chat_id=tech_chat_id,
                             message_thread_id=tech_thread_id,
                             video=msg.media_file_id,
@@ -607,55 +621,66 @@ async def _copy_ticket_history_to_tech(
                             parse_mode="HTML",
                         )
                     elif msg.media_type == "document":
-                        await bot.send_document(
+                        sent_msg = await bot.send_document(
                             chat_id=tech_chat_id,
                             message_thread_id=tech_thread_id,
                             document=msg.media_file_id,
-                            caption=caption,
-                            parse_mode="HTML",
+                            caption=caption or None,
+                            parse_mode="HTML" if caption else None,
                         )
                     elif msg.media_type == "voice":
-                        await bot.send_voice(
+                        sent_msg = await bot.send_voice(
                             chat_id=tech_chat_id,
                             message_thread_id=tech_thread_id,
                             voice=msg.media_file_id,
-                            caption=caption,
-                            parse_mode="HTML",
+                            caption=caption or None,
+                            parse_mode="HTML" if caption else None,
                         )
                     else:
-                        # Неизвестный тип медиа - отправляем как текст
-                        text = f"{prefix}{msg.message_text}"
-                        await bot.send_message(
+                        # неизвестный тип медиа — отправляем просто текст
+                        text = f"{prefix}{msg.message_text}".strip()
+                        if text:
+                            sent_msg = await bot.send_message(
+                                chat_id=tech_chat_id,
+                                message_thread_id=tech_thread_id,
+                                text=text,
+                                parse_mode="HTML",
+                            )
+                else:
+                    # Обычный текст
+                    if prefix:
+                        text = f"{prefix}{msg.message_text}".strip()
+                    else:
+                        text = (msg.message_text or "").strip()
+
+                    if text:
+                        sent_msg = await bot.send_message(
                             chat_id=tech_chat_id,
                             message_thread_id=tech_thread_id,
-                            text=text[:4000],  # Ограничение Telegram
+                            text=text,
                             parse_mode="HTML",
                         )
-                else:
-                    # Обычное текстовое сообщение
-                    text = f"{prefix}{msg.message_text}"
 
-                    # Ограничиваем длину
-                    if len(text) > 4000:
-                        text = text[:3997] + "..."
-
-                    await bot.send_message(
-                        chat_id=tech_chat_id,
-                        message_thread_id=tech_thread_id,
-                        text=text,
-                        parse_mode="HTML",
-                    )
+                # Если это служебная или внутренняя заметка — закрепляем и у НОВОГО техника
+                if sent_msg and (is_staff_note or is_internal_note):
+                    try:
+                        await bot.pin_chat_message(
+                            chat_id=tech_chat_id,
+                            message_id=sent_msg.message_id,
+                            disable_notification=True,
+                        )
+                        logger.info(
+                            f"📌 Восстановлена и закреплена {'служебная' if is_staff_note else 'внутренняя'} "
+                            f"заметка в топике техника (ticket={ticket.id})"
+                        )
+                    except TelegramBadRequest as e:
+                        logger.warning(f"⚠️ Не удалось закрепить заметку при копировании истории: {e}")
 
                 copied_count += 1
 
-                # Небольшая задержка чтобы не словить rate limit
-                if copied_count % 10 == 0:
-                    await asyncio.sleep(0.5)
-
-            except TelegramBadRequest as e:
-                logger.warning(f"⚠️ Не удалось скопировать сообщение: {e}")
             except Exception as e:
-                logger.error(f"❌ Ошибка копирования сообщения: {e}")
+                logger.error(f"❌ Ошибка при копировании сообщения #{msg.id}: {e}")
+
 
         logger.info(f"✅ Скопировано {copied_count} сообщений из {len(messages)}")
 

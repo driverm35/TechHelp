@@ -26,6 +26,33 @@ logger = logging.getLogger(__name__)
 #  Вспомогательные функции
 # ─────────────────────────────────────────────
 
+async def _pin_message_in_topic(
+    bot: Bot,
+    chat_id: int,
+    message_id: int,
+) -> bool:
+    """
+    Закрепить сообщение в чате/топике.
+
+    В Telegram форумы используют общий метод pin_chat_message,
+    но сообщение закрепляется и в конкретном топике.
+    """
+    try:
+        await bot.pin_chat_message(
+            chat_id=chat_id,
+            message_id=message_id,
+            disable_notification=True,
+        )
+        logger.info(f"📌 Закреплено сообщение {message_id} в чате {chat_id}")
+        return True
+    except TelegramBadRequest as e:
+        logger.warning(f"⚠️ Не удалось закрепить сообщение: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"❌ Ошибка закрепления сообщения: {e}")
+        return False
+
+
 def _status_emoji(status: TicketStatus) -> str:
     """Получить эмодзи статуса."""
     return {
@@ -271,8 +298,11 @@ async def cmd_staff(message: Message, bot: Bot) -> None:
     """
     Команда /s - служебная заметка.
 
-    Отправляется только в главную группу, НЕ клиенту.
-    Использование: /s <текст>
+    ✅ Отправляется:
+      • в ТЕКУЩИЙ тех-топик (и закрепляется там)
+      • в главный топик тикета (и тоже закрепляется)
+
+    НЕ отправляется клиенту.
     """
     if not message.message_thread_id:
         return
@@ -288,7 +318,134 @@ async def cmd_staff(message: Message, bot: Bot) -> None:
         )
         return
 
-    staff_text = parts[1]
+    staff_text = parts[1].strip()
+    if not staff_text:
+        await message.reply(
+            "💼 Используйте: <code>/s текст заметки</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    async with db_manager.session() as db:
+        # Находим TechThread по текущему тех-топику
+        tech_thread = await _get_tech_thread_by_location(
+            db,
+            message.chat.id,
+            message.message_thread_id
+        )
+
+        if not tech_thread:
+            await message.reply("❌ Топик не связан с тикетом")
+            return
+
+        ticket = await _get_ticket_with_client(db, tech_thread.ticket_id)
+
+        if not ticket:
+            await message.reply("❌ Тикет не найден")
+            return
+
+        sender_name = (
+            message.from_user.first_name
+            or message.from_user.username
+            or "Специалист"
+        )
+
+        # Единый текст заметки (будет одинаковым везде и в БД)
+        formatted_text = f"💼 <b>{sender_name}:</b> {staff_text}"
+
+        # Убедимся, что техник есть в users
+        from app.db.crud.user import get_or_create_user  # уже есть в модуле, но на всякий
+        await get_or_create_user(
+            db=db,
+            telegram_id=message.from_user.id,
+            username=message.from_user.username,
+            first_name=message.from_user.first_name,
+            last_name=message.from_user.last_name,
+        )
+
+        # 1) Отправляем заметку в ТЕКУЩИЙ тех-топик и закрепляем
+        try:
+            tech_msg = await bot.send_message(
+                chat_id=message.chat.id,
+                message_thread_id=message.message_thread_id,
+                text=formatted_text,
+                parse_mode="HTML"
+            )
+            await _pin_message_in_topic(
+                bot=bot,
+                chat_id=message.chat.id,
+                message_id=tech_msg.message_id,
+            )
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки заметки в тех-группу: {e}")
+
+        # 2) Отправляем заметку в ГЛАВНУЮ группу (топик тикета) и закрепляем
+        try:
+            main_msg = await bot.send_message(
+                chat_id=ticket.main_chat_id,
+                message_thread_id=ticket.main_thread_id,
+                text=formatted_text,
+                parse_mode="HTML"
+            )
+            await _pin_message_in_topic(
+                bot=bot,
+                chat_id=ticket.main_chat_id,
+                message_id=main_msg.message_id,
+            )
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки заметки в главную группу: {e}")
+
+        # 3) Логируем заметку в историю тикета, чтобы можно было восстановить
+        try:
+            from app.db.crud.message import TicketMessageCRUD  # :contentReference[oaicite:0]{index=0}
+
+            await TicketMessageCRUD.add_message(
+                session=db,
+                ticket_id=ticket.id,
+                user_id=message.from_user.id,
+                message_text=formatted_text,
+                is_from_admin=True,
+                telegram_message_id=None,  # можно не привязывать
+            )
+        except Exception as e:
+            logger.error(f"❌ Не удалось сохранить служебную заметку в БД: {e}")
+
+        await db.commit()
+
+    # Не отвечаем в топик
+    return
+
+
+async def cmd_internal(message: Message, bot: Bot) -> None:
+    """
+    Команда /i - внутренняя заметка.
+
+    ✅ Видна только в группе техника:
+      • отправляем сообщение в текущий тех-топик
+      • закрепляем его
+      • пишем в БД, чтобы при смене техника можно было восстановить
+    """
+    if not message.message_thread_id:
+        return
+
+    if not message.text:
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.reply(
+            "📝 Используйте: <code>/i текст заметки</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    internal_text = parts[1].strip()
+    if not internal_text:
+        await message.reply(
+            "📝 Используйте: <code>/i текст заметки</code>",
+            parse_mode="HTML"
+        )
+        return
 
     async with db_manager.session() as db:
         tech_thread = await _get_tech_thread_by_location(
@@ -298,11 +455,13 @@ async def cmd_staff(message: Message, bot: Bot) -> None:
         )
 
         if not tech_thread:
+            await message.reply("❌ Топик не связан с тикетом")
             return
 
         ticket = await _get_ticket_with_client(db, tech_thread.ticket_id)
 
         if not ticket:
+            await message.reply("❌ Тикет не найден")
             return
 
         sender_name = (
@@ -311,35 +470,56 @@ async def cmd_staff(message: Message, bot: Bot) -> None:
             or "Специалист"
         )
 
-        formatted_text = (
-            f"💼 <b>{sender_name}:</b> {staff_text}"
+        # Отдельный формат для внутренних заметок
+        # Важно: текст попадет в БД именно в таком виде
+        formatted_text = f"📝 <b>Внутренняя заметка ({sender_name}):</b> {internal_text}"
+
+        # Убедимся, что техник есть в users
+        from app.db.crud.user import get_or_create_user
+        await get_or_create_user(
+            db=db,
+            telegram_id=message.from_user.id,
+            username=message.from_user.username,
+            first_name=message.from_user.first_name,
+            last_name=message.from_user.last_name,
         )
 
+        # 1) Отправляем заметку в ТЕКУЩИЙ тех-топик
         try:
-            await bot.send_message(
-                chat_id=ticket.main_chat_id,
-                message_thread_id=ticket.main_thread_id,
+            internal_msg = await bot.send_message(
+                chat_id=message.chat.id,
+                message_thread_id=message.message_thread_id,
                 text=formatted_text,
                 parse_mode="HTML"
             )
-            logger.info(f"✅ Служебная заметка от {sender_name} отправлена")
-            await message.reply("✅")
+            # 2) Закрепляем её
+            await _pin_message_in_topic(
+                bot=bot,
+                chat_id=message.chat.id,
+                message_id=internal_msg.message_id,
+            )
         except Exception as e:
-            logger.error(f"❌ Ошибка отправки заметки: {e}")
-            await message.reply("❌")
+            logger.error(f"❌ Ошибка отправки внутренней заметки: {e}")
 
+        # 3) Сохраняем как сообщение тикета (но оно нигде, кроме тех-групп, не показывается)
+        try:
+            from app.db.crud.message import TicketMessageCRUD
 
-async def cmd_internal(message: Message) -> None:
-    """
-    Команда /i - внутренняя заметка.
+            await TicketMessageCRUD.add_message(
+                session=db,
+                ticket_id=ticket.id,
+                user_id=message.from_user.id,
+                message_text=formatted_text,
+                is_from_admin=True,
+                telegram_message_id=None,
+            )
+        except Exception as e:
+            logger.error(f"❌ Не удалось сохранить внутреннюю заметку в БД: {e}")
 
-    Видна только в группе техника.
-    """
-    if not message.message_thread_id:
-        return
+        await db.commit()
 
-    await message.reply("📝")
-
+    # Не отвечаем в топик
+    return
 
 # ─────────────────────────────────────────────
 #  Команды изменения статуса

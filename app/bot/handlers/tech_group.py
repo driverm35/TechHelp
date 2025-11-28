@@ -237,6 +237,40 @@ async def callback_tech_join(call: CallbackQuery, bot: Bot) -> None:
             await call.answer("❌ Техник не найден.", show_alert=True)
             return
 
+        # Проверяем и создаём пользователя в таблице users, если его нет
+        from app.db.models import User
+        user = await db.execute(
+            select(User).where(User.tg_id == tech.tg_user_id)
+        )
+        user = user.scalar_one_or_none()
+
+        if not user:
+            logger.info(f"📝 Создаём пользователя для техника ID={tech.id}, tg_id={tech.tg_user_id}")
+
+            # Получаем информацию о пользователе из Telegram
+            try:
+                tech_user_info = await bot.get_chat(tech.tg_user_id)
+
+                user = User(
+                    tg_id=tech.tg_user_id,
+                    username=tech_user_info.username,
+                    first_name=tech_user_info.first_name,
+                    last_name=tech_user_info.last_name
+                )
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось получить информацию о пользователе {tech.tg_user_id}: {e}")
+                # Создаём с минимальными данными
+                user = User(
+                    tg_id=tech.tg_user_id,
+                    username=None,
+                    first_name=tech.name,  # Используем имя техника как fallback
+                    last_name=None
+                )
+
+            db.add(user)
+            await db.flush()  # Фиксируем создание пользователя
+            logger.info(f"✅ Пользователь создан: tg_id={user.tg_id}")
+
         # TOGGLE ЛОГИКА: если техник уже закреплен за этой группой - открепляем
         if tech.group_chat_id == group_id:
             tech.group_chat_id = None

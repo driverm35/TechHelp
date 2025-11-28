@@ -4,6 +4,7 @@ import logging
 import asyncio
 
 from aiogram import Dispatcher, F, Bot
+from aiogram.enums import ChatType
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
@@ -400,15 +401,30 @@ async def _create_tech_topic(
     tech: Technician,
     topic_name: str
 ) -> int | None:
-    """Создать топик в группе техника."""
+    """Создать топик в группе техника (только если группа - форум)."""
     if not tech.group_chat_id:
         logger.error(f"❌ У техника {tech.name} нет привязанной группы")
         return None
 
     try:
+        chat = await bot.get_chat(tech.group_chat_id)
+    except TelegramBadRequest as e:
+        logger.error(f"❌ Не удалось получить чат {tech.group_chat_id} для техника {tech.name}: {e}")
+        return None
+
+    # Проверяем, что это супергруппа с включенными темами
+    is_forum = getattr(chat, "is_forum", False)
+    if not (chat.type == ChatType.SUPERGROUP and is_forum):
+        logger.error(
+            f"❌ Чат {tech.group_chat_id} для техника {tech.name} не является форумом: "
+            f"type={chat.type}, is_forum={is_forum}"
+        )
+        return None
+
+    try:
         topic = await bot.create_forum_topic(
             chat_id=tech.group_chat_id,
-            name=topic_name
+            name=topic_name,
         )
         logger.info(f"✅ Создан топик '{topic_name}' в группе {tech.group_chat_id}")
         return topic.message_thread_id
@@ -1009,7 +1025,8 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                 )
                 if not tech_thread_id:
                     await call.answer(
-                        "❌ Не удалось создать топик в группе техника.",
+                        "❌ Не удалось создать топик в группе техника.\n"
+                        "Проверьте, что в группе техника включены 'Темы' (форум).",
                         show_alert=True,
                     )
                     return

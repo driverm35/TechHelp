@@ -42,6 +42,9 @@ class ThrottlingMiddleware(BaseMiddleware):
         if self.bot_id and user_id == self.bot_id:
             return await handler(event, data)
 
+        if isinstance(event, Message) and event.chat and event.chat.type != "private":
+            return await handler(event, data)
+
         now = time.time()
         last_call = self.user_buckets.get(user_id, 0)
 

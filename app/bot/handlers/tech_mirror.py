@@ -16,6 +16,7 @@ from app.bot.handlers.main_group import _update_all_topic_titles
 from app.config import settings
 from app.db.database import db_manager
 from app.db.models import TechThread, Ticket, TicketStatus
+from app.db.crud.user import get_or_create_user
 
 
 logger = logging.getLogger(__name__)
@@ -192,6 +193,15 @@ async def handle_tech_group_message(message: Message, bot: Bot) -> None:
             media_file_id = message.voice.file_id
 
         message_text = message.text or message.caption or "[медиа]"
+
+        # Перед созданием TicketMessage убедимся, что пользователь существует
+        await get_or_create_user(
+            db=db,
+            telegram_id=message.from_user.id,
+            username=message.from_user.username,
+            first_name=message.from_user.first_name,
+            last_name=message.from_user.last_name,
+        )
 
         # 1. Пересылаем в главную группу
         try:

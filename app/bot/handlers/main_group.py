@@ -17,6 +17,7 @@ from app.db.database import db_manager
 from app.db.models import Ticket, TechThread, TicketStatus, Technician
 from app.db.crud.ticket import get_all_tech_threads_for_ticket
 from app.db.crud.tech import get_technicians, get_technician_by_id
+from app.db.crud.user import get_or_create_user
 from app.utils.cache import cache
 
 
@@ -764,7 +765,13 @@ async def handle_main_group_message(message: Message, bot: Bot) -> None:
             media_file_id = message.voice.file_id
 
         message_text = message.text or message.caption or "[медиа]"
-
+        await get_or_create_user(
+            db=db,
+            telegram_id=message.from_user.id,
+            username=message.from_user.username,
+            first_name=message.from_user.first_name,
+            last_name=message.from_user.last_name,
+        )
         # Пересылаем клиенту
         try:
             await bot.copy_message(

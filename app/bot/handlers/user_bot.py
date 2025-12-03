@@ -17,7 +17,7 @@ from app.config import settings
 from app.db.models import TicketStatus, Actor, Ticket, User
 from app.db.crud.user import get_or_create_user
 from app.db.crud.ticket import TicketCRUD, add_event, get_tech_thread_by_user_and_tech
-from app.db.crud.tech import get_technicians, get_auto_assign_technician_for_now, get_or_create_tech_thread
+from app.db.crud.tech import get_technicians, get_auto_assign_technician_for_now
 from app.db.crud.message import TicketMessageCRUD
 from app.db.database import db_manager
 from app.services.gspread_client import find_in_column_j_across_sheets
@@ -659,31 +659,6 @@ async def _forward_message_to_topic(
     Если назначен техник - дублируем в его группу.
     Сохраняем сообщение в БД.
     """
-    # 🔹 ПРОВЕРКА: игнорируем системные сообщения
-    if any(
-        [
-            message.forum_topic_created,
-            message.forum_topic_closed,
-            message.forum_topic_edited,
-            message.forum_topic_reopened,
-            message.general_forum_topic_hidden,
-            message.general_forum_topic_unhidden,
-            message.new_chat_members,
-            message.left_chat_member,
-            message.new_chat_title,
-            message.new_chat_photo,
-            message.delete_chat_photo,
-            message.group_chat_created,
-            message.supergroup_chat_created,
-            message.channel_chat_created,
-            message.migrate_to_chat_id,
-            message.migrate_from_chat_id,
-            message.pinned_message,
-            message.message_auto_delete_timer_changed,
-        ]
-    ):
-        logger.debug("⏭ Пропускаем системное сообщение")
-        return
 
     # Определяем медиа
     media_type = None

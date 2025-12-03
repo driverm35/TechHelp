@@ -1,7 +1,6 @@
 # app/bot/handlers/main_group.py
 from __future__ import annotations
 import logging
-import asyncio
 
 from aiogram import Dispatcher, F, Bot
 from aiogram.enums import ChatType
@@ -744,6 +743,13 @@ async def handle_main_group_message(message: Message, bot: Bot) -> None:
         message.video_chat_participants_invited,
     ]):
         logger.debug("⏭ Пропускаем системное сообщение в главной группе")
+        try:
+            await message.delete()
+        except TelegramBadRequest as e:
+            # сюда попадём, если:
+            # - бот не админ / нет права "Удалять сообщения"
+            # - конкретный тип системки нельзя удалить
+            logger.debug("Не смогли удалить системное сообщение: %s", e)
         return
 
     if message.forum_topic_created or message.forum_topic_closed or message.forum_topic_edited:
@@ -974,7 +980,7 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
     async with db_manager.session() as db:
         try:
             from sqlalchemy.orm import selectinload
-            from app.db.crud.ticket import get_tech_thread_by_user_and_tech, get_all_tech_threads_for_ticket
+            from app.db.crud.ticket import get_tech_thread_by_user_and_tech
 
             # Загружаем тикет с клиентом и текущим техником
             stmt = (
@@ -1443,8 +1449,6 @@ def register_handlers(dp: Dispatcher) -> None:
         F.chat.id == settings.main_group_id,
         F.message_thread_id,
     )
-
-
 
     # Callbacks
     dp.callback_query.register(

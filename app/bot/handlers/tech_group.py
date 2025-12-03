@@ -10,7 +10,6 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app.config import settings
 from app.db.database import db_manager
-from app.db.crud.user import get_or_create_user
 from app.db.crud.tech import (
     get_technicians,
     get_technician_by_id,

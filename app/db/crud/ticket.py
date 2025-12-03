@@ -7,7 +7,6 @@ from typing import Sequence, Iterable
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload, joinedload
-from app.db.crud.message import TicketMessageCRUD
 
 from app.db.models import (
     Ticket,

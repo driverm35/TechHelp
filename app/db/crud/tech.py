@@ -4,11 +4,13 @@ import logging
 from typing import Sequence, Optional
 from datetime import datetime, time
 from sqlalchemy import func, select, desc
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload
 from zoneinfo import ZoneInfo
 
 from app.config import settings
-from app.db.models import Technician, Feedback
+from app.db.models import Technician, Feedback, TechThread
 from app.utils.session_decorator import with_session
 
 logger = logging.getLogger(__name__)
@@ -300,3 +302,105 @@ async def get_auto_assign_technician_for_now(
             return tech
 
     return None
+
+@with_session
+async def get_or_create_tech_thread(
+    session: AsyncSession,
+    *,
+    ticket_id: int,
+    user_id: int,
+    tech_id: int,
+    tech_chat_id: int,
+    tech_thread_id: int,
+) -> TechThread:
+    """
+    Атомарно получить или создать TechThread для (ticket_id, tech_id).
+
+    Опирается на UNIQUE-индекс:
+        uq_tech_threads_ticket_tech (ticket_id, tech_id)
+
+    Поведение:
+      1) Если запись уже есть — возвращаем её, при необходимости обновляя
+         tech_chat_id / tech_thread_id.
+      2) Если записи нет — создаём новую.
+      3) Если параллельно кто-то успел создать (IntegrityError) —
+         перечитываем существующую и возвращаем её.
+    """
+
+    # Базовый запрос для поиска
+    base_stmt = (
+        select(TechThread)
+        .where(
+            TechThread.ticket_id == ticket_id,
+            TechThread.tech_id == tech_id,
+        )
+        .options(
+            joinedload(TechThread.ticket),
+            joinedload(TechThread.technician),
+        )
+    )
+
+    # 1) Пытаемся найти уже существующую запись
+    res = await session.execute(base_stmt)
+    thread = res.scalar_one_or_none()
+    if thread:
+        updated = False
+
+        if thread.tech_chat_id != tech_chat_id:
+            thread.tech_chat_id = tech_chat_id
+            updated = True
+
+        if thread.tech_thread_id != tech_thread_id:
+            thread.tech_thread_id = tech_thread_id
+            updated = True
+
+        if updated:
+            await session.flush()
+
+        return thread
+
+    # 2) Нет записи — пробуем создать в вложенной транзакции
+    #    (чтобы аккуратно ловить IntegrityError, не ломая внешний транзакшн)
+    async with session.begin_nested():
+        thread = TechThread(
+            ticket_id=ticket_id,
+            user_id=user_id,
+            tech_id=tech_id,
+            tech_chat_id=tech_chat_id,
+            tech_thread_id=tech_thread_id,
+        )
+        session.add(thread)
+
+        try:
+            await session.flush()
+        except IntegrityError:
+            # Кто-то параллельно создал такую же запись
+            logger.warning(
+                "Race on get_or_create_tech_thread(ticket_id=%s, tech_id=%s): "
+                "IntegrityError on insert, re-selecting existing row",
+                ticket_id,
+                tech_id,
+                exc_info=True,
+            )
+            # вложенная транзакция будет откатана автоматически
+        else:
+            # всё ок, запись создалась
+            await session.refresh(thread)
+            return thread
+
+    # 3) Если мы здесь — была IntegrityError, перечитываем существующую запись
+    res = await session.execute(base_stmt)
+    thread = res.scalar_one()
+
+    # На всякий случай синхронизируем chat/thread ID, если они отличаются
+    updated = False
+    if thread.tech_chat_id != tech_chat_id:
+        thread.tech_chat_id = tech_chat_id
+        updated = True
+    if thread.tech_thread_id != tech_thread_id:
+        thread.tech_thread_id = tech_thread_id
+        updated = True
+    if updated:
+        await session.flush()
+
+    return thread

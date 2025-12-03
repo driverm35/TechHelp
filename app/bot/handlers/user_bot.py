@@ -17,7 +17,7 @@ from app.config import settings
 from app.db.models import TicketStatus, Actor, Ticket, User
 from app.db.crud.user import get_or_create_user
 from app.db.crud.ticket import TicketCRUD, add_event, get_tech_thread_by_user_and_tech
-from app.db.crud.tech import get_technicians, get_auto_assign_technician_for_now
+from app.db.crud.tech import get_technicians, get_auto_assign_technician_for_now, get_or_create_tech_thread
 from app.db.crud.message import TicketMessageCRUD
 from app.db.database import db_manager
 from app.services.gspread_client import find_in_column_j_across_sheets
@@ -565,14 +565,13 @@ async def _forward_message_to_topic(
     # Пытаемся найти существующий тех-топик
     tech_thread = await get_tech_thread_by_user_and_tech(
         session=session,
-        user_tg_id=ticket.client_tg_id,
+        user_id=ticket.client_tg_id,
         tech_id=ticket.assigned_tech_id,
     )
 
     # 🔧 Ленивая генерация тех-топика для автоназначенного техника
     if not tech_thread:
-        from app.db.crud.tech import get_technician_by_id
-        from app.db.models import TechThread as TechThreadModel
+        from app.db.crud.tech import get_technician_by_id, get_or_create_tech_thread
 
         tech = await get_technician_by_id(
             session=session,
@@ -610,32 +609,32 @@ async def _forward_message_to_topic(
             )
             return
 
-        # Создаём запись тех-топика в БД
-        tech_thread = TechThreadModel(
+        # ✅ Создаём / получаем запись тех-топика в БД (без двойного insert)
+        tech_thread = await get_or_create_tech_thread(
+            session=session,
             ticket_id=ticket.id,
+            user_id=ticket.client_tg_id,
             tech_id=tech.id,
-            group_chat_id=tech.group_chat_id,
-            topic_id=topic.message_thread_id,
+            tech_chat_id=tech.group_chat_id,
+            tech_thread_id=topic.message_thread_id,
         )
-        session.add(tech_thread)
-        await session.commit()
-        await session.refresh(tech_thread)
 
         logger.info(
-            "✅ Создан тех-топик по автоназначению: ticket_id=%s tech_id=%s group=%s topic_id=%s",
+            "✅ Создан тех-топик по автоназначению: "
+            "ticket_id=%s tech_id=%s group=%s topic_id=%s",
             ticket.id,
             tech.id,
-            tech.group_chat_id,
-            tech_thread.topic_id,
+            tech_thread.tech_chat_id,
+            tech_thread.tech_thread_id,
         )
 
     # Копируем сообщение в тех-группу
     try:
         await bot.copy_message(
-            chat_id=tech_thread.group_chat_id,
+            chat_id=tech_thread.tech_chat_id,
             from_chat_id=message.chat.id,
             message_id=message.message_id,
-            message_thread_id=tech_thread.topic_id,
+            message_thread_id=tech_thread.tech_thread_id,
         )
     except TelegramBadRequest as e:
         logger.warning(

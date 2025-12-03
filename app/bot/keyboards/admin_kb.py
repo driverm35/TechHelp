@@ -146,6 +146,10 @@ def get_technician_view_keyboard(
         callback_data=f"admin_edit_tech_name:{tech_id}",
     )
     builder.button(
+        text="🕐 Часы автонаправления",
+        callback_data=f"admin_edit_tech_hours:{tech_id}",
+    )
+    builder.button(
         text="🗑 Удалить",
         callback_data=f"admin_delete_tech:{tech_id}",
     )
@@ -154,6 +158,36 @@ def get_technician_view_keyboard(
         callback_data="admin_back_to_tech_menu",
     )
 
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_technician_time_keyboard(
+    tech_id: int
+) -> InlineKeyboardMarkup:
+    """
+    Клавиатура для управления временем техника.
+
+    Args:
+        tech_id: ID техника
+    """
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="+ Начало перевода",
+        callback_data=f"admin_add_tech_start_time:{tech_id}",
+    )
+    builder.button(
+        text="+ Конец перевода",
+        callback_data=f"admin_add_tech_end_time:{tech_id}",
+    )
+    builder.button(
+        text="Очистить все часы",
+        callback_data=f"admin_clear_tech_hours:{tech_id}",
+    )
+    builder.button(
+        text="⬅️ Назад",
+        callback_data="admin_back_to_tech_menu",
+    )
     builder.adjust(1)
     return builder.as_markup()
 

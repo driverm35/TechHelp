@@ -1,12 +1,16 @@
 # app/bot/handlers/admin.py
 from __future__ import annotations
 import logging
+import re
+
 from dataclasses import dataclass
 from aiogram import Dispatcher, F
 from aiogram.enums import ContentType
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import Message, CallbackQuery
+from datetime import time
+
 from app.config import settings
 from app.db.database import db_manager
 from app.db.models import Technician
@@ -26,6 +30,7 @@ class AdminTechStates(StatesGroup):
     waiting_manual_name = State()
     waiting_manual_tg_id = State()
     waiting_new_name = State()
+    waiting_auto_hours = State()
 
 @dataclass
 class TechAddContext:
@@ -342,6 +347,169 @@ async def admin_add_tech_manual_tg_id(msg: Message, state: FSMContext) -> None:
     await state.clear()
 
 
+async def admin_edit_tech_hours_start(
+    call: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    """
+    Старт редактирования часов автонаправления для техника.
+    callback_data: admin_edit_tech_hours:{tech_id}
+    """
+    if not settings.is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+
+    try:
+        _, tech_id_str = call.data.split(":", maxsplit=1)
+        tech_id = int(tech_id_str)
+    except (ValueError, IndexError):
+        await call.answer("❌ Некорректные данные.", show_alert=True)
+        return
+
+    async with db_manager.session() as db:
+        tech = await get_technician_by_id(session=db, tech_id=tech_id)
+        if not tech:
+            await call.answer("❌ Техник не найден.", show_alert=True)
+            return
+
+        current_status = "включено" if tech.is_auto_assign else "выключено"
+        current_hours = (
+            f"{tech.auto_assign_start_hour}–{tech.auto_assign_end_hour}"
+            if tech.auto_assign_start_hour and tech.auto_assign_end_hour
+            else "не заданы"
+        )
+
+        text = [
+            f"🕐 <b>Автонаправление для техника</b> <b>{tech.name}</b>",
+            "",
+            f"Сейчас: <b>{current_status}</b>",
+            f"Часы: <code>{current_hours}</code>",
+            "",
+            "Отправьте часы в формате:",
+            "<code>09:00-18:00</code> или <code>9-18</code>",
+            "",
+            "Чтобы <b>выключить</b> автоназначение — отправьте:",
+            "<code>0</code>, <code>off</code> или <code>выкл</code>.",
+        ]
+
+        await call.message.answer("\n".join(text), parse_mode="HTML")
+
+    await state.set_state(AdminTechStates.waiting_auto_hours)
+    await state.update_data(tech_id=tech_id)
+    await call.answer()
+
+
+async def admin_edit_tech_hours_finish(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    """
+    Принимаем строку с часами, сохраняем в Technician.
+    """
+    data = await state.get_data()
+    tech_id = data.get("tech_id")
+    if not tech_id:
+        await message.answer("❌ Неизвестный техник. Попробуйте ещё раз через меню.")
+        await state.clear()
+        return
+
+    raw = (message.text or "").strip().lower()
+
+    # Варианты отключения
+    if raw in {"0", "off", "выкл", "нет"}:
+        async with db_manager.session() as db:
+            tech = await get_technician_by_id(session=db, tech_id=tech_id)
+            if not tech:
+                await message.answer("❌ Техник не найден.")
+                await state.clear()
+                return
+
+            tech.is_auto_assign = False
+            tech.auto_assign_start_hour = None
+            tech.auto_assign_end_hour = None
+            await db.commit()
+
+            await message.answer(
+                f"🛑 Автонаправление для техника <b>{tech.name}</b> выключено.",
+                parse_mode="HTML",
+            )
+
+        await state.clear()
+        return
+
+    # Парсим интервал
+    parsed = _parse_hours_interval(raw)
+    if not parsed:
+        await message.answer(
+            "❌ Не могу распознать время.\n"
+            "Примеры: <code>9-18</code>, <code>09:00-18:00</code>\n"
+            "Или отправьте <code>0</code> чтобы выключить.",
+            parse_mode="HTML",
+        )
+        return
+
+    start_t, end_t = parsed
+    start_str = start_t.strftime("%H:%M")
+    end_str = end_t.strftime("%H:%M")
+
+    async with db_manager.session() as db:
+        tech = await get_technician_by_id(session=db, tech_id=tech_id)
+        if not tech:
+            await message.answer("❌ Техник не найден.")
+            await state.clear()
+            return
+
+        tech.is_auto_assign = True
+        tech.auto_assign_start_hour = start_str
+        tech.auto_assign_end_hour = end_str
+        await db.commit()
+
+        await message.answer(
+            "✅ Автонаправление включено.\n"
+            f"Техник: <b>{tech.name}</b>\n"
+            f"Часы: <code>{start_str}-{end_str}</code>",
+            parse_mode="HTML",
+        )
+
+    await state.clear()
+
+
+_HOURS_RE = re.compile(
+    r"^\s*(\d{1,2})(?::?(\d{2}))?\s*-\s*(\d{1,2})(?::?(\d{2}))?\s*$"
+)
+
+
+def _parse_hours_interval(text: str) -> tuple[time, time] | None:
+    """
+    Парсим строку вида '9-18', '09-18', '09:00-18:30' → (time, time).
+    Возвращаем None, если формат кривой.
+    """
+    m = _HOURS_RE.match(text)
+    if not m:
+        return None
+
+    h1, m1, h2, m2 = m.groups()
+    h1 = int(h1)
+    h2 = int(h2)
+    m1 = int(m1) if m1 is not None else 0
+    m2 = int(m2) if m2 is not None else 0
+
+    if not (0 <= h1 <= 23 and 0 <= h2 <= 23 and 0 <= m1 <= 59 and 0 <= m2 <= 59):
+        return None
+
+    try:
+        t1 = time(hour=h1, minute=m1)
+        t2 = time(hour=h2, minute=m2)
+    except ValueError:
+        return None
+
+    if t1 == t2:
+        # интервал нулевой длины — бессмысленно
+        return None
+
+    return t1, t2
+
+
 async def admin_view_technician(call: CallbackQuery, state: FSMContext) -> None:
     """Просмотр информации о технике с статистикой."""
     if not settings.is_admin(call.from_user.id):
@@ -568,7 +736,25 @@ def _build_tech_stats_text(
         f"<b>Статус:</b> {status}",
         "",
     ]
+    # Блок про автоназначение
+    if tech.is_auto_assign:
+        if tech.auto_assign_start_hour and tech.auto_assign_end_hour:
+            auto_status = "🟢 включено"
+            auto_hours = f"{tech.auto_assign_start_hour}–{tech.auto_assign_end_hour}"
+        else:
+            auto_status = "🟡 включено, но время не задано"
+            auto_hours = "—"
+    else:
+        auto_status = "🔴 выключено"
+        auto_hours = "—"
 
+    lines.extend(
+        [
+            f"<b>Автонаправление:</b> {auto_status}",
+            f"<b>Часы автоназначения:</b> <code>{auto_hours}</code>",
+            "",
+        ]
+    )
     # Общая статистика
     if overall_avg > 0:
         stars = _format_rating_stars(overall_avg)
@@ -852,4 +1038,14 @@ def register_handlers(dp: Dispatcher) -> None:
         admin_edit_tech_name_finish,
         AdminTechStates.waiting_new_name,
         F.text,
+    )
+    # Кнопка "🕐 Часы автонаправления"
+    dp.callback_query.register(
+        admin_edit_tech_hours_start,
+        F.data.startswith("admin_edit_tech_hours:"),
+    )
+    # Приём текста с часами
+    dp.message.register(
+        admin_edit_tech_hours_finish,
+        AdminTechStates.waiting_auto_hours,
     )

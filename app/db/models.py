@@ -105,6 +105,9 @@ class Technician(Base):
     tg_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=False)
     group_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
+    is_auto_assign: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    auto_assign_start_hour: Mapped[str | None] = mapped_column(String, nullable=True)
+    auto_assign_end_hour: Mapped[str | None] = mapped_column(String, nullable=True)
 
     # Коллекции → selectin
     tickets: Mapped[list["Ticket"]] = relationship(

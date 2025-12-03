@@ -1,13 +1,17 @@
 # app/db/crud/tech.py
 from __future__ import annotations
-from typing import Sequence
-
+import logging
+from typing import Sequence, Optional
+from datetime import datetime, time
 from sqlalchemy import func, select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
+from zoneinfo import ZoneInfo
 
-from app.db.models import Technician, Feedback, Ticket
+from app.config import settings
+from app.db.models import Technician, Feedback
 from app.utils.session_decorator import with_session
 
+logger = logging.getLogger(__name__)
 
 # --- READ ---
 
@@ -220,3 +224,79 @@ async def update_technician_name(
     await session.flush()
 
     return True
+
+def _parse_time_str(value: str | None) -> Optional[time]:
+    if not value:
+        return None
+    try:
+        parts = value.strip().split(":")
+        if len(parts) == 1:
+            h = int(parts[0])
+            m = 0
+        else:
+            h = int(parts[0])
+            m = int(parts[1])
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            return None
+        return time(hour=h, minute=m)
+    except Exception:
+        return None
+
+
+def _time_in_interval(now: time, start: time, end: time) -> bool:
+    """
+    Проверка попадания времени в интервал [start, end).
+
+    Поддерживает "ночные" смены, например 22:00–06:00.
+    """
+    if start <= end:
+        return start <= now < end
+    else:
+        # через полночь
+        return now >= start or now < end
+
+@with_session
+async def get_auto_assign_technician_for_now(
+    session: AsyncSession,
+    *,
+    now: datetime | None = None,
+) -> Technician | None:
+    """
+    Найти техника с включённым автоназначением по текущему времени.
+
+    Сейчас берём ПЕРВОГО подходящего активного техника.
+    При необходимости можно усложнить (по нагрузке, round-robin и т.д.).
+    """
+    if now is None:
+        now = datetime.now(ZoneInfo(settings.timezone))
+    now_t = now.time()
+
+    stmt = (
+        select(Technician)
+        .where(
+            Technician.is_active.is_(True),
+            Technician.is_auto_assign.is_(True),
+            Technician.auto_assign_start_hour.is_not(None),
+            Technician.auto_assign_end_hour.is_not(None),
+        )
+        .order_by(Technician.id.asc())
+    )
+    res = await session.execute(stmt)
+    techs = res.scalars().all()
+
+    for tech in techs:
+        start = _parse_time_str(tech.auto_assign_start_hour)
+        end = _parse_time_str(tech.auto_assign_end_hour)
+        if not start or not end:
+            continue
+
+        if _time_in_interval(now_t, start, end):
+            logger.info(
+                "⏱ Выбран техник по автоназначению: %s (ID=%s) для времени %s",
+                tech.name,
+                tech.id,
+                now_t,
+            )
+            return tech
+
+    return None

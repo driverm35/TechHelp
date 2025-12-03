@@ -17,7 +17,7 @@ from app.config import settings
 from app.db.models import TicketStatus, Actor, Ticket, User
 from app.db.crud.user import get_or_create_user
 from app.db.crud.ticket import TicketCRUD, add_event
-from app.db.crud.tech import get_technicians
+from app.db.crud.tech import get_technicians, get_auto_assign_technician_for_now
 from app.db.crud.message import TicketMessageCRUD
 from app.db.database import db_manager
 from app.services.gspread_client import find_in_column_j_across_sheets
@@ -238,6 +238,24 @@ async def _ensure_topic_and_ticket(
             actor=Actor.CLIENT,
         )
         is_new_ticket = True
+
+        # Попробуем автоназначить техника по его часам
+        try:
+            auto_tech = await get_auto_assign_technician_for_now(session=session)
+        except Exception as e:
+            logger.error("❌ Ошибка подбора техника для автоназначения: %s", e)
+            auto_tech = None
+
+        if auto_tech:
+            ticket.assigned_tech_id = auto_tech.id
+            # flush не обязателен, но полезен, чтобы ID точно ушёл в БД до следующего CRUD
+            await session.flush()
+            logger.info(
+                "🤖 Автоматически назначен техник %s (ID=%s) на тикет #%s",
+                auto_tech.name,
+                auto_tech.id,
+                ticket.id,
+            )
 
     assert topic_id is not None
     return ticket, topic_id, is_new_ticket

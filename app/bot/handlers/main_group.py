@@ -831,17 +831,50 @@ async def handle_main_group_message(message: Message, bot: Bot) -> None:
 
         # Зеркалирование в группу техника
         if ticket.assigned_tech_id:
+            logger.debug(f"🔁 Попытка зеркалирования: ticket_id={ticket.id} assigned_tech_id={ticket.assigned_tech_id}")
             tech_thread = await _get_tech_thread(db, ticket.id, ticket.assigned_tech_id)
 
-            if tech_thread:
+            # Фоллбек: иногда TechThread создают по user_id (get_or_create_tech_thread),
+            # поэтому попробуем найти по связке user_id + tech_id
+            if not tech_thread:
+                try:
+                    from app.db.crud.ticket import get_tech_thread_by_user_and_tech
+
+                    tech_thread = await get_tech_thread_by_user_and_tech(
+                        session=db,
+                        user_id=ticket.client_tg_id,
+                        tech_id=ticket.assigned_tech_id,
+                    )
+                    if tech_thread:
+                        logger.info(
+                            "ℹ️ TechThread найден фолбеком по user_id: ticket=%s tech=%s -> group=%s thread=%s",
+                            ticket.id,
+                            ticket.assigned_tech_id,
+                            tech_thread.tech_chat_id,
+                            tech_thread.tech_thread_id,
+                        )
+                        # Обновим кеш для ускорения следующих обращений
+                        try:
+                            await cache.set_tech_thread_by_ticket(
+                                ticket.id,
+                                ticket.assigned_tech_id,
+                                tech_thread.tech_chat_id,
+                                tech_thread.tech_thread_id,
+                            )
+                        except Exception:
+                            logger.debug("⚠️ Не удалось записать tech_thread в кеш")
+                except Exception as e:
+                    logger.exception("❌ Ошибка при поиске TechThread фолбеком: %s", e)
+
+            if tech_thread and getattr(tech_thread, 'tech_chat_id', None) and getattr(tech_thread, 'tech_thread_id', None):
                 try:
                     await bot.copy_message(
                         chat_id=tech_thread.tech_chat_id,
-                        message_id=message.message_id,
                         from_chat_id=message.chat.id,
-                        message_thread_id=tech_thread.tech_thread_id
+                        message_id=message.message_id,
+                        message_thread_id=tech_thread.tech_thread_id,
                     )
-                    logger.info("✅ Сообщение зеркалировано в группу техника")
+                    logger.info("✅ Сообщение зеркалировано в группу техника (group=%s thread=%s)", tech_thread.tech_chat_id, tech_thread.tech_thread_id)
                 except TelegramBadRequest as e:
                     if "can't be copied" in str(e).lower():
                         logger.warning(f"⚠️ Сообщение {message.message_id} нельзя скопировать")
@@ -849,6 +882,8 @@ async def handle_main_group_message(message: Message, bot: Bot) -> None:
                         logger.error(f"❌ Не удалось зеркалировать: {e}")
                 except Exception as e:
                     logger.error(f"❌ Не удалось зеркалировать: {e}")
+            else:
+                logger.debug(f"ℹ️ TechThread не найден для ticket={ticket.id} tech={ticket.assigned_tech_id}; пропускаем зеркалирование")
 
 
 # ─────────────────────────────────────────────

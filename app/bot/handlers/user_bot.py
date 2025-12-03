@@ -365,10 +365,10 @@ async def _ensure_topic_and_ticket(
                         )
 
                     # отправляем шапку
-                    try:
-                        sheet_data = await get_client_data_from_sheets(user.tg_id)
-                        header_text = _build_client_header(user, sheet_data)
-                        if tech_thread:
+                    if tech_thread:
+                        try:
+                            sheet_data = await get_client_data_from_sheets(user.tg_id)
+                            header_text = _build_client_header(user, sheet_data)
                             await bot.send_message(
                                 chat_id=tech_thread.tech_chat_id,
                                 message_thread_id=tech_thread.tech_thread_id,
@@ -377,75 +377,84 @@ async def _ensure_topic_and_ticket(
                                 disable_web_page_preview=True,
                             )
                             logger.info("✅ Шапка клиента отправлена в тех-топик (автоназначение)")
+                        except Exception as e:
+                            logger.error("❌ Ошибка при отправке шапки клиента в тех-топик: %s", e)
 
-                            # кнопки управления статусом
+                        # кнопки управления статусом
+                        try:
+                            status_kb = InlineKeyboardMarkup(
+                                inline_keyboard=[[
+                                    InlineKeyboardButton(
+                                        text="🟡 В работе",
+                                        callback_data=f"status_work:{ticket.id}",
+                                    ),
+                                    InlineKeyboardButton(
+                                        text="⚪️ Закрыть",
+                                        callback_data=f"status_close:{ticket.id}",
+                                    ),
+                                ]]
+                            )
+                            status_msg = await bot.send_message(
+                                chat_id=tech_thread.tech_chat_id,
+                                message_thread_id=tech_thread.tech_thread_id,
+                                text="🎛 <b>Управление статусом:</b>",
+                                reply_markup=status_kb,
+                                parse_mode="HTML",
+                            )
                             try:
-                                status_kb = InlineKeyboardMarkup(
-                                    inline_keyboard=[[
-                                        InlineKeyboardButton(
-                                            text="🟡 В работе",
-                                            callback_data=f"status_work:{ticket.id}",
-                                        ),
-                                        InlineKeyboardButton(
-                                            text="⚪️ Закрыть",
-                                            callback_data=f"status_close:{ticket.id}",
-                                        ),
-                                    ]]
-                                )
-                                status_msg = await bot.send_message(
+                                await bot.pin_chat_message(
                                     chat_id=tech_thread.tech_chat_id,
-                                    message_thread_id=tech_thread.tech_thread_id,
-                                    text="🎛 <b>Управление статусом:</b>",
-                                    reply_markup=status_kb,
-                                    parse_mode="HTML",
+                                    message_id=status_msg.message_id,
+                                    disable_notification=True,
                                 )
-                                try:
-                                    await bot.pin_chat_message(
-                                        chat_id=tech_thread.tech_chat_id,
-                                        message_id=status_msg.message_id,
-                                        disable_notification=True,
-                                    )
-                                    logger.info("📌 Кнопки статусов закреплены в тех-топике (автоназначение)")
-                                except Exception as e:
-                                    logger.warning(
-                                        "⚠️ Не удалось закрепить кнопки статусов в тех-топике: %s",
-                                        e,
-                                    )
+                                logger.info("📌 Кнопки статусов закреплены в тех-топике (автоназначение)")
                             except Exception as e:
-                                logger.error("❌ Ошибка отправки кнопок статусов в тех-топик: %s", e)
+                                logger.warning(
+                                    "⚠️ Не удалось закрепить кнопки статусов в тех-топике: %s",
+                                    e,
+                                )
+                        except Exception as e:
+                            logger.error("❌ Ошибка отправки кнопок статусов в тех-топик: %s", e)
 
-                            # копируем первое сообщение клиента в тех-топик и сохраняем
+                        # копируем первое сообщение клиента в тех-топик и сохраняем
+                        try:
+                            sent_msg = await bot.copy_message(
+                                chat_id=tech_thread.tech_chat_id,
+                                message_thread_id=tech_thread.tech_thread_id,
+                                from_chat_id=message.chat.id,
+                                message_id=message.message_id,
+                            )
+                            logger.info("✅ Первое сообщение отправлено в тех-группу (автоназначение)")
                             try:
-                                sent_msg = await bot.copy_message(
+                                await bot.pin_chat_message(
                                     chat_id=tech_thread.tech_chat_id,
-                                    message_thread_id=tech_thread.tech_thread_id,
-                                    from_chat_id=message.chat.id,
-                                    message_id=message.message_id,
+                                    message_id=sent_msg.message_id,
+                                    disable_notification=True,
                                 )
-                                logger.info("✅ Первое сообщение отправлено в тех-группу (автоназначение)")
-                                try:
-                                    await bot.pin_chat_message(
-                                        chat_id=tech_thread.tech_chat_id,
-                                        message_id=sent_msg.message_id,
-                                        disable_notification=True,
-                                    )
-                                except Exception:
-                                    pass
+                            except Exception:
+                                pass
 
-                                await TicketMessageCRUD.add_message(
-                                    session=session,
-                                    ticket_id=ticket.id,
-                                    user_id=user.tg_id,
-                                    message_text=message.text or message.caption or "[медиа]",
-                                    is_from_admin=False,
-                                    telegram_message_id=sent_msg.message_id,
-                                )
-                            except TelegramBadRequest as e:
-                                logger.warning("⚠️ Не удалось скопировать сообщение в тех-группу: %s", e)
-                    except Exception as e:
-                        logger.error("❌ Ошибка при создании/уведомлении тех-группы: %s", e)
+                            await TicketMessageCRUD.add_message(
+                                session=session,
+                                ticket_id=ticket.id,
+                                user_id=user.tg_id,
+                                message_text=message.text or message.caption or "[медиа]",
+                                is_from_admin=False,
+                                telegram_message_id=sent_msg.message_id,
+                            )
+                        except TelegramBadRequest as e:
+                            logger.warning("⚠️ Не удалось скопировать сообщение в тех-группу: %s", e)
+                        except Exception as e:
+                            logger.error("❌ Ошибка при копировании первого сообщения в тех-топик: %s", e)
             except Exception:
                 logger.exception("❌ Непредвиденная ошибка при создании тех-топика при автоназначении")
+
+            # Если были изменения при автоназначении — зафиксируем их немедленно,
+            # чтобы последующие вебхуки (сообщения в главной группе) видели назначение
+            try:
+                await session.commit()
+            except Exception as e:
+                logger.warning("⚠️ Не удалось закоммитить сессию после автоназначения: %s", e)
 
 
     assert topic_id is not None

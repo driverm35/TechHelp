@@ -7,21 +7,26 @@ from typing import Any, Dict, Optional
 from aiogram import Dispatcher, F, Bot
 from aiogram.fsm.context import FSMContext
 from aiogram.enums import ChatType
-from aiogram.types import Message
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.db.models import TicketStatus, Actor, Ticket, User
+from app.db.models import TicketStatus, Actor, Ticket, User, TechThread
 from app.db.crud.user import get_or_create_user
 from app.db.crud.ticket import TicketCRUD, add_event, get_tech_thread_by_user_and_tech
-from app.db.crud.tech import get_technicians, get_auto_assign_technician_for_now
+from app.db.crud.tech import (
+    get_technicians,
+    get_auto_assign_technician_for_now,
+    get_technician_by_id,
+    get_or_create_tech_thread
+)
 from app.db.crud.message import TicketMessageCRUD
 from app.db.database import db_manager
 from app.services.gspread_client import find_in_column_j_across_sheets
-
+from app.utils.cache import cache
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +45,22 @@ async def get_client_data_from_sheets(tg_id: int) -> Optional[Dict[str, Any]]:
 # ─────────────────────────────────────────────
 #  Хелперы для топика/шапки
 # ─────────────────────────────────────────────
+
+async def _get_tech_thread(
+    session: AsyncSession,
+    ticket_id: int,
+    tech_id: int
+) -> TechThread | None:
+    """Получить TechThread по ticket_id и tech_id."""
+    stmt = (
+        select(TechThread)
+        .where(
+            TechThread.ticket_id == ticket_id,
+            TechThread.tech_id == tech_id
+        )
+    )
+    res = await session.execute(stmt)
+    return res.scalar_one_or_none()
 
 def _status_emoji(status: TicketStatus) -> str:
     return {
@@ -737,18 +758,64 @@ async def _forward_message_to_topic(
         )
         return
 
-    # Пытаемся найти существующий тех-топик
-    tech_thread = await get_tech_thread_by_user_and_tech(
-        session=session,
-        user_id=ticket.client_tg_id,
-        tech_id=ticket.assigned_tech_id,
-    )
+    tech_thread = None
+
+    # Зеркалирование в группу техника
+    if ticket.assigned_tech_id:
+        logger.debug(f"🔁 Попытка зеркалирования: ticket_id={ticket.id} assigned_tech_id={ticket.assigned_tech_id}")
+        # Пытаемся найти существующий тех-топик
+        tech_thread = await _get_tech_thread(session, ticket.id, ticket.assigned_tech_id)
+        logger.info("Нашли тех-топик: %s", tech_thread is not None)
+        # Фоллбек: иногда TechThread создают по user_id (get_or_create_tech_thread),
+        # поэтому попробуем найти по связке user_id + tech_id
+        if not tech_thread:
+            try:
+                tech_thread = await get_tech_thread_by_user_and_tech(
+                    session=session,
+                    user_id=ticket.client_tg_id,
+                    tech_id=ticket.assigned_tech_id,
+                )
+                if tech_thread:
+                    logger.info(
+                        "ℹ️ TechThread найден фолбеком по user_id: ticket=%s tech=%s -> group=%s thread=%s",
+                        ticket.id,
+                        ticket.assigned_tech_id,
+                        tech_thread.tech_chat_id,
+                        tech_thread.tech_thread_id,
+                    )
+                    # Обновим кеш для ускорения следующих обращений
+                    try:
+                        await cache.set_tech_thread_by_ticket(
+                            ticket.id,
+                            ticket.assigned_tech_id,
+                            tech_thread.tech_chat_id,
+                            tech_thread.tech_thread_id,
+                        )
+                    except Exception:
+                        logger.debug("⚠️ Не удалось записать tech_thread в кеш")
+            except Exception as e:
+                logger.exception("❌ Ошибка при поиске TechThread фолбеком: %s", e)
+        if tech_thread and getattr(tech_thread, 'tech_chat_id', None) and getattr(tech_thread, 'tech_thread_id', None):
+            try:
+                await bot.copy_message(
+                    chat_id=tech_thread.tech_chat_id,
+                    from_chat_id=message.chat.id,
+                    message_id=message.message_id,
+                    message_thread_id=tech_thread.tech_thread_id,
+                )
+                logger.info("✅ Сообщение зеркалировано в группу техника (group=%s thread=%s)", tech_thread.tech_chat_id, tech_thread.tech_thread_id)
+            except TelegramBadRequest as e:
+                if "can't be copied" in str(e).lower():
+                    logger.warning(f"⚠️ Сообщение {message.message_id} нельзя скопировать")
+                else:
+                    logger.error(f"❌ Не удалось зеркалировать: {e}")
+            except Exception as e:
+                logger.error(f"❌ Не удалось зеркалировать: {e}")
+        else:
+            logger.debug(f"ℹ️ TechThread не найден для ticket={ticket.id} tech={ticket.assigned_tech_id}; пропускаем зеркалирование")
 
     # Ленивая генерация тех-топика для автоназначенного техника
     if not tech_thread:
-        from app.db.crud.tech import get_technician_by_id, get_or_create_tech_thread
-        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-
         tech = await get_technician_by_id(
             session=session,
             tech_id=ticket.assigned_tech_id,
@@ -864,33 +931,7 @@ async def _forward_message_to_topic(
                 e,
             )
 
-    # 🔹 КОПИРУЕМ СООБЩЕНИЕ В ТОПИК ТЕХНИКА
-    if tech_thread and tech_thread.tech_chat_id and tech_thread.tech_thread_id:
-        try:
-            await bot.copy_message(
-                chat_id=tech_thread.tech_chat_id,
-                from_chat_id=message.chat.id,
-                message_id=message.message_id,
-                message_thread_id=tech_thread.tech_thread_id,
-            )
-            logger.info(
-                "✅ Сообщение зеркалировано в топик техника (group=%s thread=%s)",
-                tech_thread.tech_chat_id,
-                tech_thread.tech_thread_id,
-            )
-        except TelegramBadRequest as e:
-            if "can't be copied" in str(e).lower():
-                logger.warning("⚠️ Сообщение нельзя скопировать в топик техника")
-            else:
-                logger.error("❌ Не удалось зеркалировать в топик техника: %s", e)
-        except Exception as e:
-            logger.error("❌ Ошибка зеркалирования в топик техника: %s", e)
-    else:
-        logger.debug(
-            "ℹ️ TechThread не найден для ticket=%s tech=%s; пропускаем зеркалирование",
-            ticket.id,
-            ticket.assigned_tech_id,
-        )
+
 
     # Логируем событие
     await add_event(

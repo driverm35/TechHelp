@@ -120,6 +120,56 @@ def _build_client_header(user: User, sheet: Optional[Dict[str, Any]]) -> str:
 
     return "\n".join(lines)
 
+def _extract_consonants(name: str, count: int = 3) -> str:
+    """Извлечь первые N согласных букв из имени (как в main_group)."""
+    consonants_ru = "БВГДЖЗЙКЛМНПРСТФХЦЧШЩбвгджзйклмнпрстфхцчшщ"
+    consonants_en = "BCDFGHJKLMNPQRSTVWXYZbcdfghjklmnpqrstvwxyz"
+
+    result: list[str] = []
+    for ch in name:
+        if ch in consonants_ru or ch in consonants_en:
+            result.append(ch.upper())
+            if len(result) >= count:
+                break
+
+    # если согласных мало — добираем первыми буквами
+    if len(result) < 2:
+        result = [c.upper() for c in name[:count] if c.isalpha()]
+
+    return "".join(result[:count]) or "???"
+
+
+def _build_main_topic_title_with_tech(
+    user: User,
+    status: TicketStatus,
+    tech_tag: str | None = None,
+) -> str:
+    """
+    Название топика в главной группе по шаблону main_group.py:
+      🟢 [ТСТ] Имя (@username)
+      или без тега, если tech_tag=None.
+    """
+    emoji = _status_emoji(status)
+    parts: list[str] = [emoji]
+
+    if tech_tag is not None:
+        parts.append(f"[{tech_tag}]")
+
+    name_bits: list[str] = []
+    if user.first_name:
+        name_bits.append(user.first_name)
+    if user.last_name:
+        name_bits.append(user.last_name)
+
+    title = " ".join(name_bits) or user.username or f"User{user.tg_id}"
+    parts.append(title)
+
+    if user.username:
+        parts.append(f"(@{user.username})")
+
+    full = " ".join(parts)
+    return full[:125] + "..." if len(full) > 128 else full
+
 
 async def _build_technicians_keyboard(
     ticket_id: int,
@@ -248,7 +298,6 @@ async def _ensure_topic_and_ticket(
 
         if auto_tech:
             ticket.assigned_tech_id = auto_tech.id
-            # flush не обязателен, но полезен, чтобы ID точно ушёл в БД до следующего CRUD
             await session.flush()
             logger.info(
                 "🤖 Автоматически назначен техник %s (ID=%s) на тикет #%s",
@@ -256,6 +305,30 @@ async def _ensure_topic_and_ticket(
                 auto_tech.id,
                 ticket.id,
             )
+
+            # Обновляем название топика в главной группе: добавляем [ТЕГ]
+            try:
+                tag = _extract_consonants(auto_tech.name)
+                new_title = _build_main_topic_title_with_tech(
+                    user=user,
+                    status=ticket.status,
+                    tech_tag=tag,
+                )
+                await bot.edit_forum_topic(
+                    chat_id=support_chat_id,
+                    message_thread_id=topic_id,
+                    name=new_title,
+                )
+                logger.info(
+                    "📝 Название топика обновлено для автоназначенного техника: %s",
+                    new_title,
+                )
+            except TelegramBadRequest as e:
+                logger.warning(
+                    "⚠️ Не удалось обновить название топика при автоназначении: %s",
+                    e,
+                )
+
 
     assert topic_id is not None
     return ticket, topic_id, is_new_ticket
@@ -569,9 +642,10 @@ async def _forward_message_to_topic(
         tech_id=ticket.assigned_tech_id,
     )
 
-    # 🔧 Ленивая генерация тех-топика для автоназначенного техника
+    # Ленивая генерация тех-топика для автоназначенного техника
     if not tech_thread:
         from app.db.crud.tech import get_technician_by_id, get_or_create_tech_thread
+        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
         tech = await get_technician_by_id(
             session=session,
@@ -593,13 +667,18 @@ async def _forward_message_to_topic(
             )
             return
 
-        # Создаём новый топик в группе техника
-        topic_title = f"#{ticket.id} • Клиент {ticket.client_tg_id}"
+        # 👤 Формируем нормальное имя топика техника (как в main_group: без тега)
+        tech_topic_title = _build_main_topic_title_with_tech(
+            user=user,
+            status=ticket.status,
+            tech_tag=None,  # в топике техника тега нет
+        )
 
+        # Создаём новый топик в группе техника
         try:
             topic = await bot.create_forum_topic(
                 chat_id=tech.group_chat_id,
-                name=topic_title,
+                name=tech_topic_title,
             )
         except TelegramBadRequest as e:
             logger.error(
@@ -628,24 +707,60 @@ async def _forward_message_to_topic(
             tech_thread.tech_thread_id,
         )
 
-    # Копируем сообщение в тех-группу
-    try:
-        await bot.copy_message(
-            chat_id=tech_thread.tech_chat_id,
-            from_chat_id=message.chat.id,
-            message_id=message.message_id,
-            message_thread_id=tech_thread.tech_thread_id,
-        )
-    except TelegramBadRequest as e:
-        logger.warning(
-            "❌ Не удалось скопировать сообщение клиента в тех-топик: %s",
-            e,
-            exc_info=True,
-        )
-    except Exception as e:
-        logger.error(
-            "❌ Ошибка копирования сообщения в тех-топик: %s", e
-        )
+        # 📋 Шапка клиента из таблицы — сразу в тех-топик
+        try:
+            sheet_data = await get_client_data_from_sheets(user.tg_id)
+            header_text = _build_client_header(user, sheet_data)
+
+            await bot.send_message(
+                chat_id=tech_thread.tech_chat_id,
+                message_thread_id=tech_thread.tech_thread_id,
+                text=header_text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            logger.info("✅ Шапка клиента отправлена в тех-топик (автоназначение)")
+        except Exception as e:
+            logger.error("❌ Ошибка отправки шапки клиента в тех-топик: %s", e)
+
+        # 🎛 Кнопки управления статусом заявки в тех-топик + пин
+        try:
+            status_kb = InlineKeyboardMarkup(
+                inline_keyboard=[[
+                    InlineKeyboardButton(
+                        text="🟡 В работе",
+                        callback_data=f"status_work:{ticket.id}",
+                    ),
+                    InlineKeyboardButton(
+                        text="⚪️ Закрыть",
+                        callback_data=f"status_close:{ticket.id}",
+                    ),
+                ]]
+            )
+            status_msg = await bot.send_message(
+                chat_id=tech_thread.tech_chat_id,
+                message_thread_id=tech_thread.tech_thread_id,
+                text="🎛 <b>Управление статусом:</b>",
+                reply_markup=status_kb,
+                parse_mode="HTML",
+            )
+            try:
+                await bot.pin_chat_message(
+                    chat_id=tech_thread.tech_chat_id,
+                    message_id=status_msg.message_id,
+                    disable_notification=True,
+                )
+                logger.info("📌 Кнопки статусов закреплены в тех-топике (автоназначение)")
+            except Exception as e:
+                logger.warning(
+                    "⚠️ Не удалось закрепить кнопки статусов в тех-топике: %s",
+                    e,
+                )
+        except Exception as e:
+            logger.error(
+                "❌ Ошибка отправки кнопок статусов в тех-топик: %s",
+                e,
+            )
 
     # Логируем событие
     await add_event(

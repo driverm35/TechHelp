@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.db.models import TicketStatus, Actor, Ticket, User
 from app.db.crud.user import get_or_create_user
-from app.db.crud.ticket import TicketCRUD, add_event
+from app.db.crud.ticket import TicketCRUD, add_event, get_tech_thread_by_user_and_tech
 from app.db.crud.tech import get_technicians, get_auto_assign_technician_for_now
 from app.db.crud.message import TicketMessageCRUD
 from app.db.database import db_manager
@@ -460,26 +460,28 @@ async def _forward_message_to_topic(
     Сохраняем сообщение в БД.
     """
     # 🔹 ПРОВЕРКА: игнорируем системные сообщения
-    if any([
-        message.forum_topic_created,
-        message.forum_topic_closed,
-        message.forum_topic_edited,
-        message.forum_topic_reopened,
-        message.general_forum_topic_hidden,
-        message.general_forum_topic_unhidden,
-        message.new_chat_members,
-        message.left_chat_member,
-        message.new_chat_title,
-        message.new_chat_photo,
-        message.delete_chat_photo,
-        message.group_chat_created,
-        message.supergroup_chat_created,
-        message.channel_chat_created,
-        message.migrate_to_chat_id,
-        message.migrate_from_chat_id,
-        message.pinned_message,
-        message.message_auto_delete_timer_changed,
-    ]):
+    if any(
+        [
+            message.forum_topic_created,
+            message.forum_topic_closed,
+            message.forum_topic_edited,
+            message.forum_topic_reopened,
+            message.general_forum_topic_hidden,
+            message.general_forum_topic_unhidden,
+            message.new_chat_members,
+            message.left_chat_member,
+            message.new_chat_title,
+            message.new_chat_photo,
+            message.delete_chat_photo,
+            message.group_chat_created,
+            message.supergroup_chat_created,
+            message.channel_chat_created,
+            message.migrate_to_chat_id,
+            message.migrate_from_chat_id,
+            message.pinned_message,
+            message.message_auto_delete_timer_changed,
+        ]
+    ):
         logger.debug("⏭ Пропускаем системное сообщение")
         return
 
@@ -514,7 +516,9 @@ async def _forward_message_to_topic(
             from_chat_id=message.chat.id,
             message_id=message.message_id,
         )
-        logger.info(f"✅ Сообщение переслано в главную группу (топик {topic_id})")
+        logger.info(
+            "✅ Сообщение переслано в главную группу (топик %s)", topic_id
+        )
 
         # Сохраняем в БД
         await TicketMessageCRUD.add_message(
@@ -532,46 +536,117 @@ async def _forward_message_to_topic(
     except TelegramBadRequest as e:
         if "can't be copied" in str(e).lower():
             logger.warning(
-                f"⚠️ Сообщение {message.message_id} нельзя скопировать "
-                f"(тип: {message.content_type})"
+                "⚠️ Сообщение %s нельзя скопировать (тип: %s)",
+                message.message_id,
+                message.content_type,
             )
         else:
-            logger.error(f"❌ Ошибка пересылки в главную группу: {e}")
+            logger.error("❌ Ошибка пересылки в главную группу: %s", e)
     except Exception as e:
-        logger.error(f"❌ Ошибка пересылки в главную группу: {e}")
+        logger.error("❌ Ошибка пересылки в главную группу: %s", e)
 
-    # 🔹 Если назначен техник - пересылаем в его топик
-    if ticket.assigned_tech_id:
-        from app.db.crud.ticket import get_tech_thread_by_user_and_tech
-
-        tech_thread = await get_tech_thread_by_user_and_tech(
+    # Если тикет не назначен — ничего больше не делаем
+    if not ticket.assigned_tech_id:
+        # Лог события только о пересылке в main (ниже тоже логируется)
+        await add_event(
             session=session,
-            user_id=user.tg_id,
+            ticket_id=ticket.id,
+            actor=Actor.CLIENT,
+            action="client_message",
+            payload={
+                "telegram_message_id": message.message_id,
+                "chat_id": message.chat.id,
+                "text": message_text,
+                "is_first": False,
+            },
+        )
+        return
+
+    # Пытаемся найти существующий тех-топик
+    tech_thread = await get_tech_thread_by_user_and_tech(
+        session=session,
+        user_tg_id=ticket.client_tg_id,
+        tech_id=ticket.assigned_tech_id,
+    )
+
+    # 🔧 Ленивая генерация тех-топика для автоназначенного техника
+    if not tech_thread:
+        from app.db.crud.tech import get_technician_by_id
+        from app.db.models import TechThread as TechThreadModel
+
+        tech = await get_technician_by_id(
+            session=session,
             tech_id=ticket.assigned_tech_id,
         )
+        if not tech:
+            logger.warning(
+                "❌ Автоназначенный техник не найден в БД: tech_id=%s ticket_id=%s",
+                ticket.assigned_tech_id,
+                ticket.id,
+            )
+            return
 
-        if tech_thread:
-            try:
-                await bot.copy_message(
-                    chat_id=tech_thread.tech_chat_id,
-                    message_thread_id=tech_thread.tech_thread_id,
-                    from_chat_id=message.chat.id,
-                    message_id=message.message_id,
-                )
-                logger.info(
-                    f"✅ Сообщение клиента зеркалировано в группу техника "
-                    f"{tech_thread.tech_chat_id} (топик {tech_thread.tech_thread_id})"
-                )
-            except TelegramBadRequest as e:
-                if "can't be copied" in str(e).lower():
-                    logger.warning(
-                        f"⚠️ Сообщение {message.message_id} нельзя скопировать "
-                        f"в группу техника (тип: {message.content_type})"
-                    )
-                else:
-                    logger.error(f"❌ Ошибка зеркалирования в группу техника: {e}")
-            except Exception as e:
-                logger.error(f"❌ Ошибка зеркалирования в группу техника: {e}")
+        if not tech.group_chat_id:
+            logger.warning(
+                "❌ У техника нет group_chat_id: tech_id=%s ticket_id=%s",
+                tech.id,
+                ticket.id,
+            )
+            return
+
+        # Создаём новый топик в группе техника
+        topic_title = f"#{ticket.id} • Клиент {ticket.client_tg_id}"
+
+        try:
+            topic = await bot.create_forum_topic(
+                chat_id=tech.group_chat_id,
+                name=topic_title,
+            )
+        except TelegramBadRequest as e:
+            logger.error(
+                "❌ Не удалось создать тех-топик для автоназначения: %s",
+                e,
+                exc_info=True,
+            )
+            return
+
+        # Создаём запись тех-топика в БД
+        tech_thread = TechThreadModel(
+            ticket_id=ticket.id,
+            tech_id=tech.id,
+            group_chat_id=tech.group_chat_id,
+            topic_id=topic.message_thread_id,
+        )
+        session.add(tech_thread)
+        await session.commit()
+        await session.refresh(tech_thread)
+
+        logger.info(
+            "✅ Создан тех-топик по автоназначению: ticket_id=%s tech_id=%s group=%s topic_id=%s",
+            ticket.id,
+            tech.id,
+            tech.group_chat_id,
+            tech_thread.topic_id,
+        )
+
+    # Копируем сообщение в тех-группу
+    try:
+        await bot.copy_message(
+            chat_id=tech_thread.group_chat_id,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+            message_thread_id=tech_thread.topic_id,
+        )
+    except TelegramBadRequest as e:
+        logger.warning(
+            "❌ Не удалось скопировать сообщение клиента в тех-топик: %s",
+            e,
+            exc_info=True,
+        )
+    except Exception as e:
+        logger.error(
+            "❌ Ошибка копирования сообщения в тех-топик: %s", e
+        )
 
     # Логируем событие
     await add_event(

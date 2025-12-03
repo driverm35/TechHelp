@@ -392,11 +392,15 @@ async def admin_edit_tech_hours_start(
             "<code>0</code>, <code>off</code> или <code>выкл</code>.",
         ]
 
-        await call.message.answer("\n".join(text), parse_mode="HTML")
+        prompt_msg = await call.message.answer("\n".join(text), parse_mode="HTML")
 
     await state.set_state(AdminTechStates.waiting_auto_hours)
-    await state.update_data(tech_id=tech_id)
+    await state.update_data(
+        tech_id=tech_id,
+        auto_hours_msg_id=prompt_msg.message_id,  # запоминаем msg_id промпта
+    )
     await call.answer()
+
 
 
 async def admin_edit_tech_hours_finish(
@@ -405,9 +409,15 @@ async def admin_edit_tech_hours_finish(
 ) -> None:
     """
     Принимаем строку с часами, сохраняем в Technician.
+    После этого:
+    - удаляем сообщение с промптом "Автонаправление для техника"
+    - удаляем сообщение администратора с временем
+    - открываем карточку техника с кнопками
     """
     data = await state.get_data()
     tech_id = data.get("tech_id")
+    prompt_msg_id = data.get("auto_hours_msg_id")
+
     if not tech_id:
         await message.answer("❌ Неизвестный техник. Попробуйте ещё раз через меню.")
         await state.clear()
@@ -429,11 +439,49 @@ async def admin_edit_tech_hours_finish(
             tech.auto_assign_end_hour = None
             await db.commit()
 
-            await message.answer(
-                f"🛑 Автонаправление для техника <b>{tech.name}</b> выключено.",
-                parse_mode="HTML",
-            )
+            # Получаем статистику для карточки
+            from app.db.crud.tech import get_technician_stats
 
+            records, total_count, overall_avg = await get_technician_stats(
+                session=db,
+                tech_id=tech_id,
+                limit=10,
+                offset=0,
+            )
+            total_pages = max(1, (total_count + 10 - 1) // 10)
+
+        # Удаляем "служебные" сообщения
+        try:
+            await message.delete()
+        except Exception as e:
+            logger.warning("Не удалось удалить сообщение с часами: %s", e)
+
+        if prompt_msg_id:
+            try:
+                await message.bot.delete_message(
+                    chat_id=message.chat.id,
+                    message_id=prompt_msg_id,
+                )
+            except Exception as e:
+                logger.warning("Не удалось удалить промпт автонаправления: %s", e)
+
+        # Формируем карточку
+        text = _build_tech_stats_text(
+            tech=tech,
+            records=records,
+            overall_avg=overall_avg,
+            current_page=1,
+            total_pages=total_pages,
+        )
+        text += "\n\n🛑 Автонаправление выключено."
+
+        kb = admin_kb.get_technician_view_keyboard(
+            tech_id=tech.id,
+            stats_page=1,
+            total_pages=total_pages,
+        )
+
+        await message.answer(text, reply_markup=kb, parse_mode="HTML")
         await state.clear()
         return
 
@@ -464,14 +512,55 @@ async def admin_edit_tech_hours_finish(
         tech.auto_assign_end_hour = end_str
         await db.commit()
 
-        await message.answer(
-            "✅ Автонаправление включено.\n"
-            f"Техник: <b>{tech.name}</b>\n"
-            f"Часы: <code>{start_str}-{end_str}</code>",
-            parse_mode="HTML",
-        )
+        # Получаем статистику для карточки
+        from app.db.crud.tech import get_technician_stats
 
+        records, total_count, overall_avg = await get_technician_stats(
+            session=db,
+            tech_id=tech_id,
+            limit=10,
+            offset=0,
+        )
+        total_pages = max(1, (total_count + 10 - 1) // 10)
+
+    # Удаляем "служебные" сообщения
+    try:
+        await message.delete()
+    except Exception as e:
+        logger.warning("Не удалось удалить сообщение с часами: %s", e)
+
+    if prompt_msg_id:
+        try:
+            await message.bot.delete_message(
+                chat_id=message.chat.id,
+                message_id=prompt_msg_id,
+            )
+        except Exception as e:
+            logger.warning("Не удалось удалить промпт автонаправления: %s", e)
+
+    # Формируем карточку
+    text = _build_tech_stats_text(
+        tech=tech,
+        records=records,
+        overall_avg=overall_avg,
+        current_page=1,
+        total_pages=total_pages,
+    )
+    text += (
+        "\n\n✅ Автонаправление включено.\n"
+        f"Техник: <b>{tech.name}</b>\n"
+        f"Часы: <code>{start_str}-{end_str}</code>"
+    )
+
+    kb = admin_kb.get_technician_view_keyboard(
+        tech_id=tech.id,
+        stats_page=1,
+        total_pages=total_pages,
+    )
+
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
     await state.clear()
+
 
 
 _HOURS_RE = re.compile(

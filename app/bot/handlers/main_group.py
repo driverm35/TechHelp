@@ -706,7 +706,17 @@ async def _copy_ticket_history_to_tech(
 
 async def handle_main_group_message(message: Message, bot: Bot) -> None:
     """Обработка сообщений из топиков главной группы."""
+    logger.debug(
+        "📨 handle_main_group_message: chat=%s thread=%s from=%s is_bot=%s content_type=%s",
+        message.chat.id,
+        message.message_thread_id,
+        getattr(message.from_user, "id", None),
+        getattr(message.from_user, "is_bot", None),
+        message.content_type,
+    )
+
     if not message.message_thread_id:
+        logger.debug("ℹ️ Пропускаем сообщение без thread_id в главной группе")
         return
 
     if any([

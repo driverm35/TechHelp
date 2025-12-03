@@ -864,6 +864,34 @@ async def _forward_message_to_topic(
                 e,
             )
 
+    # 🔹 КОПИРУЕМ СООБЩЕНИЕ В ТОПИК ТЕХНИКА
+    if tech_thread and tech_thread.tech_chat_id and tech_thread.tech_thread_id:
+        try:
+            await bot.copy_message(
+                chat_id=tech_thread.tech_chat_id,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id,
+                message_thread_id=tech_thread.tech_thread_id,
+            )
+            logger.info(
+                "✅ Сообщение зеркалировано в топик техника (group=%s thread=%s)",
+                tech_thread.tech_chat_id,
+                tech_thread.tech_thread_id,
+            )
+        except TelegramBadRequest as e:
+            if "can't be copied" in str(e).lower():
+                logger.warning("⚠️ Сообщение нельзя скопировать в топик техника")
+            else:
+                logger.error("❌ Не удалось зеркалировать в топик техника: %s", e)
+        except Exception as e:
+            logger.error("❌ Ошибка зеркалирования в топик техника: %s", e)
+    else:
+        logger.debug(
+            "ℹ️ TechThread не найден для ticket=%s tech=%s; пропускаем зеркалирование",
+            ticket.id,
+            ticket.assigned_tech_id,
+        )
+
     # Логируем событие
     await add_event(
         session=session,

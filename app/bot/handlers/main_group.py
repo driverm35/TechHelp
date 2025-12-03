@@ -705,7 +705,7 @@ async def _copy_ticket_history_to_tech(
 
 async def handle_main_group_message(message: Message, bot: Bot) -> None:
     """Обработка сообщений из топиков главной группы."""
-    logger.debug(
+    logger.info(
         "📨 handle_main_group_message: chat=%s thread=%s from=%s is_bot=%s content_type=%s",
         message.chat.id,
         message.message_thread_id,
@@ -742,7 +742,7 @@ async def handle_main_group_message(message: Message, bot: Bot) -> None:
         message.video_chat_ended,
         message.video_chat_participants_invited,
     ]):
-        logger.debug("⏭ Пропускаем системное сообщение в главной группе")
+        logger.info("⏭ Пытаемся удалить системное сообщение в главной группе")
         try:
             await message.delete()
         except TelegramBadRequest as e:
@@ -758,28 +758,13 @@ async def handle_main_group_message(message: Message, bot: Bot) -> None:
     if message.text and message.text.startswith("/"):
         return
 
-    if any([
-        message.new_chat_members,
-        message.left_chat_member,
-        message.new_chat_title,
-        message.new_chat_photo,
-        message.delete_chat_photo,
-        message.group_chat_created,
-        message.supergroup_chat_created,
-        message.channel_chat_created,
-        message.migrate_to_chat_id,
-        message.migrate_from_chat_id,
-        message.pinned_message,
-    ]):
-        return
-
     async with db_manager.session() as db:
         ticket = await _get_ticket_by_thread(
             db,
             message.chat.id,
             message.message_thread_id
         )
-
+        logger.info(f"Найден тикет для топика {message.message_thread_id}")
         if not ticket:
             logger.warning(f"⚠️ Тикет не найден для топика {message.message_thread_id}")
             return

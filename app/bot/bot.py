@@ -119,8 +119,6 @@ async def setup_bot() -> tuple[Bot, Dispatcher]:
     dp.callback_query.middleware(GlobalErrorMiddleware())
     dp.message.middleware(LoggingMiddleware())
     dp.callback_query.middleware(LoggingMiddleware())
-    dp.message.middleware(ThrottlingMiddleware())
-    dp.callback_query.middleware(ThrottlingMiddleware())
 
     # Guard для callback в группах - теперь как middleware
     dp.callback_query.middleware(GroupCallbacksGuardMiddleware())

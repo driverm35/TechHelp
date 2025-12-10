@@ -65,35 +65,74 @@ def _status_emoji(status: TicketStatus) -> str:
     }.get(status, "⚪️")
 
 
-def _build_topic_title(user: User, status: TicketStatus, assigned: bool) -> str:
+def _get_tech_tag(tech: Technician | None) -> str:
     """
-    Имя топика:
-      🟢 [-] Имя (@username)  - если не назначен
-      🟢 Имя (@username)      - если назначен техник
-    """
-    parts: list[str] = [_status_emoji(status)]
+    Получить тег техника из согласных букв его имени.
     
-    if not assigned:
-        parts.append("[-]")
+    Args:
+        tech: Объект техника или None
+        
+    Returns:
+        Тег техника (например, "ПВЛ") или "???" если техник None
+    """
+    if tech is None:
+        return "???"
+    
+    return _extract_consonants(tech.name, count=3)
 
-    name_bits: list[str] = []
+
+def _build_topic_title(
+    user: User,
+    status: TicketStatus,
+    assigned: bool,
+    tech_tag: str | None = None,
+) -> str:
+    """
+    Построить название топика по единому шаблону.
+
+    Args:
+        user: Объект пользователя (клиента)
+        status: Статус тикета
+        assigned: Назначен ли техник
+        tech_tag: Тег техника (только для главной группы). Если None - тег не добавляется
+
+    Returns:
+        Название топика
+
+    Примеры:
+        - Главная группа с техником: "🟢 [ПВЛ] Иван (@ivan)"
+        - Главная группа без техника: "🟢 [-] Иван (@ivan)"
+        - Группа техника: "🟢 Иван (@ivan)"
+    """
+    emoji = _status_emoji(status)
+    
+    parts = [emoji]
+
+    # Добавляем тег (для главной группы)
+    if tech_tag is not None:
+        parts.append(f"[{tech_tag}]")
+
+    # Формируем имя клиента
+    name_bits = []
     if user.first_name:
         name_bits.append(user.first_name)
     if user.last_name:
         name_bits.append(user.last_name)
-    title = " ".join(name_bits) or user.username or str(user.tg_id)
+    
+    client_name = " ".join(name_bits) or user.username or str(user.tg_id)
+    parts.append(client_name)
 
-    parts.append(title)
+    # Username если есть
     if user.username:
         parts.append(f"(@{user.username})")
 
-    full_title = " ".join(parts)
-    
+    title = " ".join(parts)
+
     # Telegram ограничивает 128 символов
-    if len(full_title) > 128:
-        full_title = full_title[:125] + "..."
-    
-    return full_title
+    if len(title) > 128:
+        title = title[:125] + "..."
+
+    return title
 
 
 def _get_status_control_keyboard(ticket_id: int) -> InlineKeyboardMarkup:
@@ -147,6 +186,7 @@ async def _update_all_topic_titles(
         user=ticket.client,
         status=ticket.status,
         assigned=has_tech,
+        tech_tag=_get_tech_tag(await get_technician_by_id(db, ticket.assigned_tech_id)) if has_tech else "-",
     )
 
     logger.debug(f"📝 Проверка главного топика: '{main_title}'")
@@ -184,6 +224,7 @@ async def _update_all_topic_titles(
         user=ticket.client,
         status=ticket.status,
         assigned=True,
+        tech_tag=None,
     )
 
     for thread in tech_threads:
@@ -952,10 +993,11 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
             tag = _extract_consonants(tech.name)
 
             # ✅ ИСПРАВЛЕНО: Формируем название топика техника (БЕЗ тега)
-            tech_topic_name = _build_topic_title(
+            tech_title = _build_topic_title(
                 user=ticket.client,
                 status=ticket.status,
-                assigned=True  # у техника всегда assigned=True
+                assigned=True,
+                tech_tag=None,
             )
 
             # 1) Отключаем зеркалирование от прежнего техника (если был)

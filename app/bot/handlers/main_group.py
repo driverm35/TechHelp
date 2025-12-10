@@ -136,34 +136,17 @@ async def _update_all_topic_titles(
         return
 
     # -----------------------------------
-    # 1. Подготовка данных клиента
+    # 1. Определяем есть ли назначенный техник
     # -----------------------------------
-    client_name = (
-        ticket.client.first_name
-        or ticket.client.username
-        or f"User{ticket.client.tg_id}"
-    )
-    client_username = ticket.client.username
-
-    # -----------------------------------
-    # 2. Определяем тег техника для ГЛАВНОГО топика
-    # -----------------------------------
-    tech_tag = "-"
-    if ticket.assigned_tech_id:
-        tech = await get_technician_by_id(session=db, tech_id=ticket.assigned_tech_id)
-        if tech:
-            tech_tag = _extract_consonants(tech.name)
-        else:
-            tech_tag = "???"
+    has_tech = ticket.assigned_tech_id is not None
 
     # -----------------------------------------------------
-    # 🔹 Формируем итоговое имя главного топика
+    # 2. Формируем итоговое имя главного топика
     # -----------------------------------------------------
     main_title = _build_topic_title(
+        user=ticket.client,
         status=ticket.status,
-        client_name=client_name,
-        client_username=client_username,
-        tech_tag=tech_tag,
+        assigned=has_tech,
     )
 
     logger.debug(f"📝 Проверка главного топика: '{main_title}'")
@@ -223,12 +206,11 @@ async def _update_all_topic_titles(
     # -----------------------------------------------------
     tech_threads = await get_all_tech_threads_for_ticket(session=db, ticket_id=ticket.id)
 
-    # Имя топика у техника всегда без тега
+    # Имя топика у техника всегда assigned=True (без [-] в начале)
     tech_title = _build_topic_title(
+        user=ticket.client,
         status=ticket.status,
-        client_name=client_name,
-        client_username=client_username,
-        tech_tag=None
+        assigned=True,
     )
 
     for thread in tech_threads:

@@ -1,4 +1,4 @@
-helpcall.suppapp.ru {
+techhelp.massforma.ru {
 	encode gzip zstd
 
 	reverse_proxy bot:8080 {

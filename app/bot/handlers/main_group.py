@@ -547,11 +547,12 @@ async def _copy_ticket_history_to_tech(
 
         # Отправляем шапку тоже через очередь
         await redis_streams.enqueue({
+            "bot_token": bot.token,
             "type": "text",
             "text": header_text,
             "target_chat_id": tech_chat_id,
             "target_thread_id": tech_thread_id,
-            "pin": False,                 # шапку не пиним
+            "pin": False,
             "attempt": 0
         })
 
@@ -596,6 +597,7 @@ async def _copy_ticket_history_to_tech(
                 final_text = f"{prefix}{text}".strip()
 
                 payload = {
+                    "bot_token": bot.token,
                     "target_chat_id": tech_chat_id,
                     "target_thread_id": tech_thread_id,
                     "attempt": 0,
@@ -660,6 +662,7 @@ async def _copy_ticket_history_to_tech(
 
         # 4. Добавляем разделитель — тоже через очередь
         await redis_streams.enqueue({
+            "bot_token": bot.token,
             "type": "text",
             "text": "📍 <b>Конец истории</b>",
             "target_chat_id": tech_chat_id,

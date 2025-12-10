@@ -186,7 +186,7 @@ async def _update_all_topic_titles(
         user=ticket.client,
         status=ticket.status,
         assigned=has_tech,
-        tech_tag=_get_tech_tag(await get_technician_by_id(db, ticket.assigned_tech_id)) if has_tech else "-",
+        tech_tag=_get_tech_tag(await get_technician_by_id(session=db, tech_id=ticket.assigned_tech_id)) if has_tech else "-",
     )
 
     logger.debug(f"📝 Проверка главного топика: '{main_title}'")

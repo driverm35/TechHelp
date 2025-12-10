@@ -17,7 +17,7 @@ from app.config import settings
 from app.db.database import db_manager
 from app.db.models import TechThread, Ticket, TicketStatus
 from app.db.crud.user import get_or_create_user
-
+from app.utils.redis_streams import redis_streams
 
 logger = logging.getLogger(__name__)
 
@@ -125,20 +125,12 @@ async def _send_feedback_poll(bot: Bot, ticket_id: int, client_tg_id: int, tech_
 # ─────────────────────────────────────────────
 
 async def handle_tech_group_message(message: Message, bot: Bot) -> None:
-    """
-    Обработка сообщений из топиков группы техника.
-
-    Логика:
-    1. Найти TechThread по tech_chat_id + tech_thread_id
-    2. Переслать в главную группу (топик тикета)
-    3. Переслать клиенту
-    4. Не пересылать команды
-    """
-    # Игнорируем сообщения не из топиков
+    """Обработка сообщений из топиков группы техника."""
+    
     if not message.message_thread_id:
         return
 
-    # Игнорируем служебные сообщения
+    # Игнорируем служебные
     if any([
         message.forum_topic_created,
         message.forum_topic_closed,
@@ -159,17 +151,14 @@ async def handle_tech_group_message(message: Message, bot: Bot) -> None:
 
     # Проверяем команды
     if message.text and message.text.startswith("/"):
-        # Служебные команды - не пересылаем
         if message.text.lower().startswith((
-            "/s", "/i",
+            "/s", "/i", "feed", "/f",
             "/work", "/done"
         )):
             return
-        # Остальные команды тоже не пересылаем
         return
 
     async with db_manager.session() as db:
-        # Находим TechThread
         tech_thread = await _get_tech_thread_by_location(
             db,
             message.chat.id,
@@ -183,7 +172,6 @@ async def handle_tech_group_message(message: Message, bot: Bot) -> None:
             )
             return
 
-        # Получаем тикет с клиентом
         ticket = await _get_ticket_with_client(db, tech_thread.ticket_id)
 
         if not ticket:
@@ -221,7 +209,6 @@ async def handle_tech_group_message(message: Message, bot: Bot) -> None:
 
         message_text = message.text or message.caption or "[медиа]"
 
-        # Перед созданием TicketMessage убедимся, что пользователь существует
         await get_or_create_user(
             db=db,
             telegram_id=message.from_user.id,
@@ -230,62 +217,67 @@ async def handle_tech_group_message(message: Message, bot: Bot) -> None:
             last_name=message.from_user.last_name,
         )
 
-        # 1. Пересылаем в главную группу
+        # ✅ ИСПРАВЛЕНО: 1. Пересылаем в главную группу через Redis
         try:
-            await bot.copy_message(
-                chat_id=ticket.main_chat_id,
-                message_thread_id=ticket.main_thread_id,
-                from_chat_id=message.chat.id,
-                message_id=message.message_id
-            )
+            main_payload = {
+                "bot_token": bot.token,
+                "type": "text" if not media_type else media_type,
+                "target_chat_id": ticket.main_chat_id,
+                "target_thread_id": ticket.main_thread_id,
+                "ticket_id": ticket.id,
+            }
+            
+            if media_type:
+                main_payload["file_id"] = media_file_id
+                if media_caption:
+                    main_payload["caption"] = media_caption
+            else:
+                main_payload["text"] = message_text
+            
+            await redis_streams.enqueue(main_payload)
             logger.info(
-                f"✅ Сообщение техника переслано в главную группу "
+                f"✅ Сообщение техника добавлено в очередь для главной группы "
                 f"(топик {ticket.main_thread_id})"
             )
-            # Сохраняем в БД (от техника)
+            
+            # Сохраняем в БД
             from app.db.crud.message import TicketMessageCRUD
 
             await TicketMessageCRUD.add_message(
                 session=db,
                 ticket_id=ticket.id,
-                user_id=message.from_user.id,  # ID техника
+                user_id=message.from_user.id,
                 message_text=message_text,
-                is_from_admin=True,  # От поддержки/техника
+                is_from_admin=True,
                 media_type=media_type,
                 media_file_id=media_file_id,
                 media_caption=media_caption,
                 telegram_message_id=message.message_id,
             )
 
-        except TelegramBadRequest as e:
-            if "can't be copied" in str(e).lower():
-                logger.warning(
-                    f"⚠️ Сообщение {message.message_id} нельзя скопировать "
-                    f"(тип: {message.content_type})"
-                )
-            else:
-                logger.error(f"❌ Ошибка пересылки в главную группу: {e}")
         except Exception as e:
             logger.error(f"❌ Ошибка пересылки в главную группу: {e}")
 
-        # 2. Пересылаем клиенту
+        # ✅ ИСПРАВЛЕНО: 2. Пересылаем клиенту через Redis
         try:
-            await bot.copy_message(
-                chat_id=ticket.client_tg_id,
-                from_chat_id=message.chat.id,
-                message_id=message.message_id
-            )
-            logger.info(
-                f"✅ Сообщение техника переслано клиенту {ticket.client_tg_id}"
-            )
-        except TelegramBadRequest as e:
-            if "can't be copied" in str(e).lower():
-                logger.warning(
-                    f"⚠️ Сообщение {message.message_id} нельзя скопировать клиенту "
-                    f"(тип: {message.content_type})"
-                )
+            client_payload = {
+                "bot_token": bot.token,
+                "type": "text" if not media_type else media_type,
+                "target_chat_id": ticket.client_tg_id,
+                "ticket_id": ticket.id,
+            }
+            
+            if media_type:
+                client_payload["file_id"] = media_file_id
+                if media_caption:
+                    client_payload["caption"] = media_caption
             else:
-                logger.error(f"❌ Ошибка пересылки клиенту: {e}")
+                client_payload["text"] = message_text
+            
+            await redis_streams.enqueue(client_payload)
+            logger.info(
+                f"✅ Сообщение техника добавлено в очередь для клиента {ticket.client_tg_id}"
+            )
         except Exception as e:
             logger.error(f"❌ Ошибка пересылки клиенту: {e}")
 
@@ -413,6 +405,94 @@ async def cmd_staff(message: Message, bot: Bot) -> None:
         await db.commit()
 
     # Не отвечаем в топик
+    return
+
+
+async def cmd_feedback(message: Message, bot: Bot) -> None:
+    """
+    /feed, /f — вручную отправить клиенту опрос по тикету.
+
+    Ограничения:
+      ✔ работает только в тех-топике
+      ✔ тикет должен быть в статусе CLOSED
+      ✔ опрос не отправляется повторно
+    """
+
+    # 1. Команда возможна только в топике
+    if not message.message_thread_id:
+        return
+
+    # 2. Проверяем, что текст — команда
+    if not message.text or not message.text.lower().startswith(("/feed", "/f")):
+        return
+
+    async with db_manager.session() as db:
+
+        # 3. Ищем тех-топик
+        tech_thread = await _get_tech_thread_by_location(
+            db,
+            message.chat.id,
+            message.message_thread_id
+        )
+
+        if not tech_thread:
+            await message.reply("❌ Этот топик не связан с тикетом")
+            return
+
+        # 4. Получаем тикет с клиентом
+        ticket = await _get_ticket_with_client(db, tech_thread.ticket_id)
+
+        if not ticket:
+            await message.reply("❌ Тикет не найден", parse_mode="HTML")
+            return
+
+        if not ticket.client:
+            await message.reply("❌ У тикета нет клиента", parse_mode="HTML")
+            return
+
+        # 5. Проверка: тикет должен быть закрыт
+        if ticket.status != TicketStatus.CLOSED:
+            await message.reply(
+                "⚠️ Опрос можно отправить только для <b>закрытого</b> тикета.",
+                parse_mode="HTML"
+            )
+            return
+
+        # 6. Проверка на повторную отправку опроса
+        #    Чтобы не спамить клиенту
+        feedback_key = f"feedback_sent:{ticket.id}"
+        from app.utils.cache import cache
+
+        already = await cache.get(feedback_key)
+        if already:
+            await message.reply(
+                "ℹ️ Опрос уже был отправлен ранее.",
+                parse_mode="HTML"
+            )
+            return
+
+        # 7. Отправляем опрос
+        try:
+            await _send_feedback_poll(
+                bot=bot,
+                ticket_id=ticket.id,
+                client_tg_id=ticket.client_tg_id,
+                tech_id=ticket.assigned_tech_id
+            )
+
+            # Запоминаем факт отправки (TTL = 7 дней)
+            await cache.set(feedback_key, True, ttl=7*24*3600)
+
+            await message.reply("📨 Опрос отправлен клиенту.", parse_mode="HTML")
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки опроса вручную: {e}")
+            await message.reply(
+                "❌ Ошибка при отправке опроса.",
+                parse_mode="HTML"
+            )
+
+    # Не отвечаем в tech-topic
     return
 
 
@@ -614,14 +694,6 @@ async def cmd_done(message: Message, bot: Bot) -> None:
 
         logger.info(f"⚪️ Тикет #{ticket.id} закрыт")
 
-        # 🔹 Отправляем опрос клиенту (с tech_id)
-        await _send_feedback_poll(
-            bot=bot,
-            ticket_id=ticket.id,
-            client_tg_id=ticket.client_tg_id,
-            tech_id=ticket.assigned_tech_id
-        )
-
         # Обновляем эмодзи в топиках
         # Перезагружаем тикет с нужными связями
         stmt = (
@@ -736,6 +808,13 @@ def register_handlers(dp: Dispatcher) -> None:
     dp.message.register(
         cmd_internal,
         Command("internal", "i"),
+        F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
+        F.message_thread_id,
+    )
+    # Команда отправки опроса
+    dp.message.register(
+        cmd_feedback,
+        Command("feed", "f"),
         F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
         F.message_thread_id,
     )

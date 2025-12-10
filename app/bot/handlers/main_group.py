@@ -10,6 +10,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.db.database import db_manager
@@ -17,8 +18,9 @@ from app.db.models import Ticket, TechThread, TicketStatus, Technician
 from app.db.crud.ticket import get_all_tech_threads_for_ticket
 from app.db.crud.tech import get_technicians, get_technician_by_id
 from app.db.crud.user import get_or_create_user
+from app.queue.mirror_queue import MirrorQueue
 from app.utils.cache import cache
-
+from app.utils.redis_streams import redis_streams
 
 logger = logging.getLogger(__name__)
 
@@ -133,11 +135,17 @@ async def _update_all_topic_titles(
     ticket: Ticket,
     db: AsyncSession,
 ) -> None:
-    """Обновить названия всех топиков с проверкой кеша."""
+    """Обновляет названия топиков в главной группе и всех тех-групп.
+    Сравнение ведётся ТОЛЬКО с БД, кеш игнорируется полностью.
+    """
+
     if not ticket.client:
         logger.error(f"❌ У тикета {ticket.id} нет загруженного client")
         return
 
+    # -----------------------------------
+    # 1. Подготовка данных клиента
+    # -----------------------------------
     client_name = (
         ticket.client.first_name
         or ticket.client.username
@@ -145,120 +153,125 @@ async def _update_all_topic_titles(
     )
     client_username = ticket.client.username
 
-    # ─────────────────────────────────────────────
-    # 1. Обновляем топик в главной группе
-    # ─────────────────────────────────────────────
-
-    # ВАЖНО: В главном топике ВСЕГДА показываем тег техника, если он назначен
-    tech_tag = "-"  # По умолчанию, если техник не назначен
-
+    # -----------------------------------
+    # 2. Определяем тег техника для ГЛАВНОГО топика
+    # -----------------------------------
+    tech_tag = "-"
     if ticket.assigned_tech_id:
         tech = await get_technician_by_id(session=db, tech_id=ticket.assigned_tech_id)
         if tech:
             tech_tag = _extract_consonants(tech.name)
-            logger.debug(f"   Техник: {tech.name} → тег [{tech_tag}]")
         else:
-            logger.warning(f"⚠️ Техник #{ticket.assigned_tech_id} не найден в БД")
             tech_tag = "???"
 
+    # -----------------------------------------------------
+    # 🔹 Формируем итоговое имя главного топика
+    # -----------------------------------------------------
     main_title = _build_topic_title(
         status=ticket.status,
         client_name=client_name,
         client_username=client_username,
-        tech_tag=tech_tag,  #  Всегда передаем тег (даже если это "-")
+        tech_tag=tech_tag,
     )
 
-    logger.debug(f"📝 Главная группа: новое название '{main_title}'")
+    logger.debug(f"📝 Проверка главного топика: '{main_title}'")
 
-    # Проверяем кеш
-    cached_title = await cache.get_topic_title(
-        ticket.main_chat_id,
-        ticket.main_thread_id
+    # -----------------------------------------------------
+    # 3. Получаем запись TechThread для главного топика
+    # -----------------------------------------------------
+    stmt = (
+        select(TechThread)
+        .where(
+            TechThread.ticket_id == ticket.id,
+            TechThread.is_main == True
+        )
+        .limit(1)
     )
+    result = await db.execute(stmt)
+    main_thread = result.scalar_one_or_none()
 
-    if cached_title != main_title:
+    # Если записи нет — создаём (редкий случай)
+    if not main_thread:
+        main_thread = TechThread(
+            ticket_id=ticket.id,
+            tech_id=None,
+            tech_chat_id=ticket.main_chat_id,
+            tech_thread_id=ticket.main_thread_id,
+            tech_thread_name=main_title,
+            is_main=True
+        )
+        db.add(main_thread)
+        await db.commit()
+        await db.refresh(main_thread)
+
+    # -----------------------------------------------------
+    # 4. Обновляем главный топик, если название отличается
+    # -----------------------------------------------------
+    if main_thread.tech_thread_name != main_title:
         try:
             await bot.edit_forum_topic(
                 chat_id=ticket.main_chat_id,
                 message_thread_id=ticket.main_thread_id,
                 name=main_title
             )
-            logger.info(f"✅ Обновлено название топика в главной группе: '{main_title}'")
-
-            # Сохраняем в кеш
-            await cache.set_topic_title(
-                ticket.main_chat_id,
-                ticket.main_thread_id,
-                main_title
-            )
+            logger.info(f"✅ Обновлено название главного топика → {main_title}")
         except TelegramBadRequest as e:
-            if "TOPIC_NOT_MODIFIED" in str(e):
-                await cache.set_topic_title(
-                    ticket.main_chat_id,
-                    ticket.main_thread_id,
-                    main_title
-                )
-                logger.debug("ℹ️ Название топика главной группы уже актуально (кеш обновлен)")
-            else:
-                logger.error(f"❌ Ошибка обновления главного топика: {e}")
+            # Даже если TOPIC_NOT_MODIFIED — название в БД обновляем.
+            logger.warning(f"⚠️ Ошибка изменения главного топика: {e}")
+
+        # Обновляем в БД
+        main_thread.tech_thread_name = main_title
+        await db.flush()
+
     else:
-        logger.debug("ℹ️ Название топика главной группы не изменилось (пропускаем)")
+        logger.debug("ℹ️ Главное название уже корректное — обновление не требуется.")
 
-    # ─────────────────────────────────────────────
-    # 2. Обновляем ВСЕ топики техников для этого тикета
-    # ─────────────────────────────────────────────
-
+    # -----------------------------------------------------
+    # 5. Обновляем ВСЕ тех-топики
+    # -----------------------------------------------------
     tech_threads = await get_all_tech_threads_for_ticket(session=db, ticket_id=ticket.id)
 
-    for tech_thread in tech_threads:
-        # 🔹 В топике техника тег НЕ показываем
-        tech_title = _build_topic_title(
-            status=ticket.status,
-            client_name=client_name,
-            client_username=client_username,
-            tech_tag=None,  # В топике техника тега нет
-        )
+    # Имя топика у техника всегда без тега
+    tech_title = _build_topic_title(
+        status=ticket.status,
+        client_name=client_name,
+        client_username=client_username,
+        tech_tag=None
+    )
+
+    for thread in tech_threads:
+        if thread.is_main:
+            continue  # главный уже обработан
 
         logger.debug(
-            f"📝 Топик техника #{tech_thread.tech_id}: новое название '{tech_title}' "
-            f"(группа {tech_thread.tech_chat_id}, топик {tech_thread.tech_thread_id})"
+            f"🛠 Проверка тех-топика {thread.tech_chat_id}/{thread.tech_thread_id} "
+            f"→ '{tech_title}'"
         )
 
-        # Проверяем кеш
-        cached_tech_title = await cache.get_topic_title(
-            tech_thread.tech_chat_id,
-            tech_thread.tech_thread_id
-        )
-
-        if cached_tech_title != tech_title:
+        # Нужно обновлять если в БД название НЕ совпадает
+        if thread.tech_thread_name != tech_title:
             try:
                 await bot.edit_forum_topic(
-                    chat_id=tech_thread.tech_chat_id,
-                    message_thread_id=tech_thread.tech_thread_id,
+                    chat_id=thread.tech_chat_id,
+                    message_thread_id=thread.tech_thread_id,
                     name=tech_title
                 )
                 logger.info(
-                    f"✅ Обновлено название топика у техника #{tech_thread.tech_id}: '{tech_title}' "
-                    f"(группа {tech_thread.tech_chat_id}, топик {tech_thread.tech_thread_id})"
-                )
-
-                await cache.set_topic_title(
-                    tech_thread.tech_chat_id,
-                    tech_thread.tech_thread_id,
-                    tech_title
+                    f"✅ Обновлено название тех-топика {thread.tech_id} → '{tech_title}'"
                 )
             except TelegramBadRequest as e:
-                if "TOPIC_NOT_MODIFIED" in str(e):
-                    await cache.set_topic_title(
-                        tech_thread.tech_chat_id,
-                        tech_thread.tech_thread_id,
-                        tech_title
-                    )
-                    logger.debug(f"ℹ️ Название топика техника #{tech_thread.tech_id} уже актуально")
-                else:
-                    logger.error(f"❌ Ошибка обновления топика техника: {e}")
+                logger.warning(f"⚠️ Ошибка изменения тех-топика: {e}")
+
+            # Обновляем в БД
+            thread.tech_thread_name = tech_title
+            await db.flush()
+
         else:
-            logger.debug(f"ℹ️ Название топика техника #{tech_thread.tech_id} не изменилось")
+            logger.debug(
+                f"ℹ️ Топик техника #{thread.tech_id} уже имеет корректное название"
+            )
+
+    await db.commit()
 
 
 async def _pin_message_in_topic(
@@ -524,37 +537,29 @@ async def _copy_ticket_history_to_tech(
     db: AsyncSession,
 ) -> int:
     """
-    Скопировать всю историю тикета в топик техника.
-
-    Args:
-        bot: Экземпляр бота
-        ticket: Тикет (должен быть загружен с client и messages)
-        tech_chat_id: ID группы техника
-        tech_thread_id: ID топика в группе техника
-        db: Сессия БД
-
-    Returns:
-        Количество скопированных сообщений
+    Копирует историю тикета в топик техника,
+    но НЕ отправляет в Telegram напрямую — только ставит задачи в Redis Streams.
     """
+
     copied_count = 0
 
     try:
-        # 1. Отправляем шапку с данными клиента
+        # 1. Заготавливаем шапку клиента
         header_text = await _get_client_header_text(ticket)
 
-        try:
-            await bot.send_message(
-                chat_id=tech_chat_id,
-                message_thread_id=tech_thread_id,
-                text=header_text,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
-            logger.info("✅ Шапка клиента отправлена в топик техника")
-        except Exception as e:
-            logger.error(f"❌ Ошибка отправки шапки: {e}")
+        # Отправляем шапку тоже через очередь
+        await redis_streams.enqueue({
+            "type": "text",
+            "text": header_text,
+            "target_chat_id": tech_chat_id,
+            "target_thread_id": tech_thread_id,
+            "pin": False,                 # шапку не пиним
+            "attempt": 0
+        })
 
-        # 2. Получаем все сообщения тикета из БД
+        logger.info("📨 Шапка клиента отправлена в очередь для топика техника")
+
+        # 2. Получаем историю сообщений
         from sqlalchemy import select as sql_select
         from app.db.models import TicketMessage
 
@@ -570,134 +575,106 @@ async def _copy_ticket_history_to_tech(
             logger.info("ℹ️ История сообщений пуста")
             return copied_count
 
-        logger.info(f"📋 Найдено {len(messages)} сообщений для копирования")
+        logger.info(f"📋 История содержит {len(messages)} сообщений")
 
-        # 3. Копируем каждое сообщение
+        # 3. Обрабатываем каждое сообщение
         for msg in messages:
             try:
-                # Распознаём служебные/внутренние заметки по префиксу
-                text_stripped = (msg.message_text or "").lstrip()
+                text = msg.message_text or ""
+                text_stripped = text.lstrip()
+
                 is_staff_note = text_stripped.startswith("💼 ")
                 is_internal_note = text_stripped.startswith("📝 ")
+                should_pin = is_staff_note or is_internal_note
 
-                # Формируем префикс отправителя только для обычных сообщений
-                if msg.is_from_admin and not (is_staff_note or is_internal_note):
+                # Формируем отображаемый текст (с префиксами)
+                if msg.is_from_admin and not should_pin:
                     prefix = "🛠️ <b>Поддержка:</b>\n"
-                elif not msg.is_from_admin:
+                elif not msg.is_from_admin and not should_pin:
                     prefix = "👤 <b>Клиент:</b>\n"
                 else:
-                    # для служебных/внутренних заметок текста уже достаточно
                     prefix = ""
 
-                sent_msg = None
+                final_text = f"{prefix}{text}".strip()
 
-                # Если есть медиа
+                payload = {
+                    "target_chat_id": tech_chat_id,
+                    "target_thread_id": tech_thread_id,
+                    "attempt": 0,
+                    "pin": should_pin,
+                }
+
+                # --- Медиа ---
                 if msg.has_media and msg.media_file_id:
-                    if prefix:
-                        base_caption = f"{prefix}{msg.media_caption or msg.message_text or ''}".strip()
-                    else:
-                        # Для служебных/внутренних — используем оригинальный текст как есть
-                        base_caption = msg.media_caption or msg.message_text or ""
 
-                    caption = base_caption
-                    if len(caption) > 1000:
-                        caption = caption[:997] + "."
+                    caption = msg.media_caption or text or ""
+                    caption = f"{prefix}{caption}".strip() if prefix else caption
 
                     if msg.media_type == "photo":
-                        sent_msg = await bot.send_photo(
-                            chat_id=tech_chat_id,
-                            message_thread_id=tech_thread_id,
-                            photo=msg.media_file_id,
-                            caption=caption,
-                            parse_mode="HTML",
-                        )
+                        payload.update({
+                            "type": "photo",
+                            "file_id": msg.media_file_id,
+                            "caption": caption,
+                        })
+
                     elif msg.media_type == "video":
-                        sent_msg = await bot.send_video(
-                            chat_id=tech_chat_id,
-                            message_thread_id=tech_thread_id,
-                            video=msg.media_file_id,
-                            caption=caption,
-                            parse_mode="HTML",
-                        )
+                        payload.update({
+                            "type": "video",
+                            "file_id": msg.media_file_id,
+                            "caption": caption,
+                        })
+
                     elif msg.media_type == "document":
-                        sent_msg = await bot.send_document(
-                            chat_id=tech_chat_id,
-                            message_thread_id=tech_thread_id,
-                            document=msg.media_file_id,
-                            caption=caption or None,
-                            parse_mode="HTML" if caption else None,
-                        )
+                        payload.update({
+                            "type": "document",
+                            "file_id": msg.media_file_id,
+                            "caption": caption,
+                        })
+
                     elif msg.media_type == "voice":
-                        sent_msg = await bot.send_voice(
-                            chat_id=tech_chat_id,
-                            message_thread_id=tech_thread_id,
-                            voice=msg.media_file_id,
-                            caption=caption or None,
-                            parse_mode="HTML" if caption else None,
-                        )
+                        payload.update({
+                            "type": "voice",
+                            "file_id": msg.media_file_id,
+                            "caption": caption,
+                        })
+
                     else:
-                        # неизвестный тип медиа — отправляем просто текст
-                        text = f"{prefix}{msg.message_text}".strip()
-                        if text:
-                            sent_msg = await bot.send_message(
-                                chat_id=tech_chat_id,
-                                message_thread_id=tech_thread_id,
-                                text=text,
-                                parse_mode="HTML",
-                            )
+                        # fallback → просто как текст
+                        payload.update({
+                            "type": "text",
+                            "text": final_text
+                        })
+
                 else:
-                    # Обычный текст
-                    if prefix:
-                        text = f"{prefix}{msg.message_text}".strip()
-                    else:
-                        text = (msg.message_text or "").strip()
+                    # --- Обычный текст ---
+                    payload.update({
+                        "type": "text",
+                        "text": final_text
+                    })
 
-                    if text:
-                        sent_msg = await bot.send_message(
-                            chat_id=tech_chat_id,
-                            message_thread_id=tech_thread_id,
-                            text=text,
-                            parse_mode="HTML",
-                        )
-
-                # Если это служебная или внутренняя заметка — закрепляем и у НОВОГО техника
-                if sent_msg and (is_staff_note or is_internal_note):
-                    try:
-                        await bot.pin_chat_message(
-                            chat_id=tech_chat_id,
-                            message_id=sent_msg.message_id,
-                            disable_notification=True,
-                        )
-                        logger.info(
-                            f"📌 Восстановлена и закреплена {'служебная' if is_staff_note else 'внутренняя'} "
-                            f"заметка в топике техника (ticket={ticket.id})"
-                        )
-                    except TelegramBadRequest as e:
-                        logger.warning(f"⚠️ Не удалось закрепить заметку при копировании истории: {e}")
-
+                await redis_streams.enqueue(payload)
                 copied_count += 1
 
             except Exception as e:
-                logger.error(f"❌ Ошибка при копировании сообщения #{msg.id}: {e}")
+                logger.error(f"❌ Ошибка упаковки сообщения #{msg.id} для воркера: {e}")
 
+        logger.info(f"✅ В очередь поставлено {copied_count} сообщений истории")
 
-        logger.info(f"✅ Скопировано {copied_count} сообщений из {len(messages)}")
-
-        # 4. Отправляем разделитель
-        try:
-            await bot.send_message(
-                chat_id=tech_chat_id,
-                message_thread_id=tech_thread_id,
-                text="📍 <b>Конец истории</b>",
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
+        # 4. Добавляем разделитель — тоже через очередь
+        await redis_streams.enqueue({
+            "type": "text",
+            "text": "📍 <b>Конец истории</b>",
+            "target_chat_id": tech_chat_id,
+            "target_thread_id": tech_thread_id,
+            "pin": False,
+            "attempt": 0
+        })
 
     except Exception as e:
-        logger.error(f"❌ Ошибка копирования истории: {e}", exc_info=True)
+        logger.error(f"❌ Ошибка при копировании истории: {e}", exc_info=True)
 
     return copied_count
+
 
 # ─────────────────────────────────────────────
 #  Обработка сообщений из топиков
@@ -718,6 +695,7 @@ async def handle_main_group_message(message: Message, bot: Bot) -> None:
         logger.debug("ℹ️ Пропускаем сообщение без thread_id в главной группе")
         return
 
+    # Системные сообщения - пытаемся удалить
     if any([
         message.forum_topic_created,
         message.forum_topic_closed,
@@ -742,17 +720,11 @@ async def handle_main_group_message(message: Message, bot: Bot) -> None:
         message.video_chat_ended,
         message.video_chat_participants_invited,
     ]):
-        logger.info("⏭ Пытаемся удалить системное сообщение в главной группе")
+        logger.info("⭐ Пытаемся удалить системное сообщение в главной группе")
         try:
             await message.delete()
         except TelegramBadRequest as e:
-            # сюда попадём, если:
-            # - бот не админ / нет права "Удалять сообщения"
-            # - конкретный тип системки нельзя удалить
             logger.debug("Не смогли удалить системное сообщение: %s", e)
-        return
-
-    if message.forum_topic_created or message.forum_topic_closed or message.forum_topic_edited:
         return
 
     if message.text and message.text.startswith("/"):
@@ -791,6 +763,7 @@ async def handle_main_group_message(message: Message, bot: Bot) -> None:
             media_file_id = message.voice.file_id
 
         message_text = message.text or message.caption or "[медиа]"
+        
         await get_or_create_user(
             db=db,
             telegram_id=message.from_user.id,
@@ -798,14 +771,25 @@ async def handle_main_group_message(message: Message, bot: Bot) -> None:
             first_name=message.from_user.first_name,
             last_name=message.from_user.last_name,
         )
-        # Пересылаем клиенту
+
+        # ✅ ИСПРАВЛЕНО: Отправка клиенту через Redis Streams
         try:
-            await bot.copy_message(
-                chat_id=ticket.client_tg_id,
-                from_chat_id=message.chat.id,
-                message_id=message.message_id
-            )
-            logger.info(f"✅ Сообщение переслано клиенту {ticket.client_tg_id}")
+            payload = {
+                "bot_token": bot.token,  # ✅ Добавлен токен
+                "type": "text" if not media_type else media_type,  # ✅ Добавлен type
+                "target_chat_id": ticket.client_tg_id,  # ✅ ИСПРАВЛЕНО: был tech_thread
+                "ticket_id": ticket.id,
+            }
+            
+            if media_type:
+                payload["file_id"] = media_file_id
+                if media_caption:
+                    payload["caption"] = media_caption
+            else:
+                payload["text"] = message_text
+            
+            await redis_streams.enqueue(payload)
+            logger.info(f"✅ Сообщение добавлено в очередь для клиента {ticket.client_tg_id}")
 
             # Сохраняем в БД
             from app.db.crud.message import TicketMessageCRUD
@@ -822,21 +806,14 @@ async def handle_main_group_message(message: Message, bot: Bot) -> None:
                 telegram_message_id=message.message_id,
             )
 
-        except TelegramBadRequest as e:
-            if "can't be copied" in str(e).lower():
-                logger.warning(f"⚠️ Сообщение {message.message_id} нельзя скопировать")
-            else:
-                logger.error(f"❌ Не удалось переслать сообщение клиенту: {e}")
         except Exception as e:
-            logger.error(f"❌ Не удалось переслать сообщение клиенту: {e}")
+            logger.error(f"❌ Не удалось добавить в очередь для клиента: {e}")
 
         # Зеркалирование в группу техника
         if ticket.assigned_tech_id:
-            logger.debug(f"🔁 Попытка зеркалирования: ticket_id={ticket.id} assigned_tech_id={ticket.assigned_tech_id}")
+            logger.debug(f"🔍 Попытка зеркалирования: ticket_id={ticket.id} assigned_tech_id={ticket.assigned_tech_id}")
             tech_thread = await _get_tech_thread(db, ticket.id, ticket.assigned_tech_id)
 
-            # Фоллбек: иногда TechThread создают по user_id (get_or_create_tech_thread),
-            # поэтому попробуем найти по связке user_id + tech_id
             if not tech_thread:
                 try:
                     from app.db.crud.ticket import get_tech_thread_by_user_and_tech
@@ -854,7 +831,6 @@ async def handle_main_group_message(message: Message, bot: Bot) -> None:
                             tech_thread.tech_chat_id,
                             tech_thread.tech_thread_id,
                         )
-                        # Обновим кеш для ускорения следующих обращений
                         try:
                             await cache.set_tech_thread_by_ticket(
                                 ticket.id,
@@ -869,23 +845,28 @@ async def handle_main_group_message(message: Message, bot: Bot) -> None:
 
             if tech_thread and getattr(tech_thread, 'tech_chat_id', None) and getattr(tech_thread, 'tech_thread_id', None):
                 try:
-                    await bot.copy_message(
-                        chat_id=tech_thread.tech_chat_id,
-                        from_chat_id=message.chat.id,
-                        message_id=message.message_id,
-                        message_thread_id=tech_thread.tech_thread_id,
-                    )
-                    logger.info("✅ Сообщение зеркалировано в группу техника (group=%s thread=%s)", tech_thread.tech_chat_id, tech_thread.tech_thread_id)
-                except TelegramBadRequest as e:
-                    if "can't be copied" in str(e).lower():
-                        logger.warning(f"⚠️ Сообщение {message.message_id} нельзя скопировать")
+                    # ✅ ИСПРАВЛЕНО: Зеркалирование через Redis Streams
+                    tech_payload = {
+                        "bot_token": bot.token,
+                        "type": "text" if not media_type else media_type,
+                        "target_chat_id": tech_thread.tech_chat_id,
+                        "target_thread_id": tech_thread.tech_thread_id,
+                        "ticket_id": ticket.id,
+                    }
+                    
+                    if media_type:
+                        tech_payload["file_id"] = media_file_id
+                        if media_caption:
+                            tech_payload["caption"] = media_caption
                     else:
-                        logger.error(f"❌ Не удалось зеркалировать: {e}")
+                        tech_payload["text"] = message_text
+                    
+                    await redis_streams.enqueue(tech_payload)
+                    logger.info("✅ Сообщение зеркалировано в группу техника (group=%s thread=%s)", tech_thread.tech_chat_id, tech_thread.tech_thread_id)
                 except Exception as e:
                     logger.error(f"❌ Не удалось зеркалировать: {e}")
             else:
                 logger.debug(f"ℹ️ TechThread не найден для ticket={ticket.id} tech={ticket.assigned_tech_id}; пропускаем зеркалирование")
-
 
 # ─────────────────────────────────────────────
 #  Команда /tech
@@ -964,7 +945,6 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
 
     async with db_manager.session() as db:
         try:
-            from sqlalchemy.orm import selectinload
             from app.db.crud.ticket import get_tech_thread_by_user_and_tech
 
             # Загружаем тикет с клиентом и текущим техником
@@ -1111,13 +1091,7 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
 
                 # Копируем историю тикета в новый тех-топик
                 try:
-                    copied = await _copy_ticket_history_to_tech(
-                        bot=bot,
-                        ticket=ticket,
-                        tech_chat_id=tech.group_chat_id,
-                        tech_thread_id=tech_thread_id,
-                        db=db,
-                    )
+                    copied = await _copy_ticket_history_to_tech(bot, ticket.id, tech_thread.tech_chat_id, tech_thread.tech_thread_id, db)
                     logger.info(
                         f"📋 Скопировано {copied} сообщений в новый топик техника "
                         f"(тикет #{ticket.id}, техник {tech.id})"
@@ -1190,38 +1164,41 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
 # ─────────────────────────────────────────────
 
 async def callback_change_status(call: CallbackQuery, bot: Bot) -> None:
-    """Обработка изменения статуса через кнопки."""
+    """Обработка изменения статуса тикета (NEW / WORK / CLOSED).
+    Даже если статус не меняется — топики обязаны обновиться!
+    """
 
-    # 🔹 Проверка прав (админы или техники могут менять статус)
     is_admin = settings.is_admin(call.from_user.id)
 
+    # ----------------------------
+    # 1. Парсим callback
+    # ----------------------------
     try:
         action, ticket_id_str = call.data.split(":", maxsplit=1)
         ticket_id = int(ticket_id_str)
 
-        # Определяем новый статус
-        new_status_map = {
+        map_status = {
             "status_new": TicketStatus.NEW,
             "status_work": TicketStatus.WORK,
             "status_close": TicketStatus.CLOSED,
         }
 
-        new_status = new_status_map.get(action)
-
+        new_status = map_status.get(action)
         if not new_status:
             await call.answer("❌ Неизвестный статус", show_alert=True)
             return
 
-    except (ValueError, IndexError) as e:
-        logger.error(f"Ошибка парсинга callback_data: {e}")
-        await call.answer("❌ Некорректные данные.", show_alert=True)
+    except Exception as e:
+        logger.error(f"❌ Ошибка парсинга callback_data: {e}")
+        await call.answer("❌ Ошибка данных.", show_alert=True)
         return
 
+    # ----------------------------
+    # 2. Загружаем тикет
+    # ----------------------------
     async with db_manager.session() as db:
         try:
-            from sqlalchemy.orm import selectinload
 
-            # 🔹 Загружаем тикет со ВСЕМИ необходимыми relationships
             stmt = (
                 select(Ticket)
                 .options(
@@ -1237,181 +1214,125 @@ async def callback_change_status(call: CallbackQuery, bot: Bot) -> None:
                 await call.answer("❌ Тикет не найден.", show_alert=True)
                 return
 
-            # 🔹 Определяем, является ли пользователь техником
+            # ----------------------------
+            # 3. Определяем теха (если не админ)
+            # ----------------------------
             current_tech = None
+
             if not is_admin:
-                # Ищем техника по tg_user_id
-                all_techs = await get_technicians(session=db, active_only=True)
-                for t in all_techs:
+                techs = await get_technicians(session=db, active_only=True)
+                for t in techs:
                     if t.tg_user_id == call.from_user.id:
                         current_tech = t
                         break
 
                 if not current_tech:
-                    await call.answer("⛔ Нет прав на изменение статуса", show_alert=True)
+                    await call.answer("⛔ У вас нет прав", show_alert=True)
                     return
 
-                # Проверяем, назначен ли этот техник на тикет
-                if ticket.assigned_tech_id != current_tech.id:
-                    await call.answer("⛔ Вы не назначены на этот тикет", show_alert=True)
+                if ticket.assigned_tech_id and ticket.assigned_tech_id != current_tech.id:
+                    await call.answer("⛔ Вы не назначены на тикет", show_alert=True)
                     return
-
-            if ticket.status == new_status:
-                status_names = {
-                    TicketStatus.NEW: "Новый",
-                    TicketStatus.WORK: "В работе",
-                    TicketStatus.CLOSED: "Закрыт",
-                }
-                await call.answer(f"✅ Уже в статусе '{status_names[new_status]}'")
-                return
 
             old_status = ticket.status
 
-            # Если техник меняет статус НА "В работе" и еще не назначен - назначаем его
+            # ============================================================
+            # 4. Если статус НЕ меняется → всё равно обновляем названия!
+            # ============================================================
+            if ticket.status == new_status:
+                logger.info(
+                    f"ℹ️ Статус тикета #{ticket.id} уже {new_status}, но обновляем топики"
+                )
+
+                await _update_all_topic_titles(bot, ticket, db)
+
+                emoji = {
+                    TicketStatus.NEW: "🟢",
+                    TicketStatus.WORK: "🟡",
+                    TicketStatus.CLOSED: "⚪️",
+                }[new_status]
+
+                await call.answer(f"{emoji} Статус уже установлен\n🔄 Топики обновлены", show_alert=True)
+                return
+
+            # ============================================================
+            # 5. Статус действительно меняется → обновляем
+            # ============================================================
+            # Техник сам берёт тикет → назначаем его
             if current_tech and new_status == TicketStatus.WORK and not ticket.assigned_tech_id:
                 ticket.assigned_tech_id = current_tech.id
-                logger.info(
-                    f"✅ Техник {current_tech.name} автоматически назначен на тикет #{ticket.id} "
-                    f"при переводе в статус WORK"
-                )
+                logger.info(f"🔧 Автоназначение техника {current_tech.name} на тикет #{ticket.id}")
 
             # Обновляем статус
             ticket.status = new_status
             await db.commit()
-
-            logger.info(
-                f"📊 Тикет #{ticket.id} переведен из {old_status.value} "
-                f"в статус {new_status.value} пользователем {call.from_user.id}"
-            )
-
-            # Перезагружаем тикет с relationships после коммита
             await db.refresh(ticket)
-            stmt = (
-                select(Ticket)
-                .options(
-                    selectinload(Ticket.client),
-                    selectinload(Ticket.assigned_tech)
-                )
-                .where(Ticket.id == ticket_id)
-            )
-            result = await db.execute(stmt)
-            ticket = result.scalar_one_or_none()
 
-            if not ticket:
-                logger.error("❌ Не удалось перезагрузить тикет после коммита")
-                await call.answer("❌ Произошла ошибка.", show_alert=True)
-                return
-
-            # 🟢 Если переводим из CLOSED в NEW/WORK — надо переоткрыть топики
+            # ============================================================
+            # 6. Открытие топиков при переходе в NEW/WORK
+            # ============================================================
             if new_status in (TicketStatus.NEW, TicketStatus.WORK):
-                # 1) Главная группа
-                if ticket.main_chat_id and ticket.main_thread_id:
-                    try:
-                        await bot.reopen_forum_topic(
-                            chat_id=ticket.main_chat_id,
-                            message_thread_id=ticket.main_thread_id,
-                        )
-                        logger.info(
-                            f"✅ Переоткрыт топик {ticket.main_thread_id} "
-                            f"в главной группе {ticket.main_chat_id}"
-                        )
-                    except TelegramBadRequest as e:
-                        logger.debug(
-                            f"ℹ️ Не удалось переоткрыть главный топик "
-                            f"{ticket.main_thread_id}: {e}"
-                        )
 
-                # 2) Все тех-топики этого тикета
-                tech_threads = await get_all_tech_threads_for_ticket(
-                    session=db,
-                    ticket_id=ticket.id,
-                )
-
-                for tech_thread in tech_threads:
-                    try:
-                        await _reopen_tech_topic(
-                            bot,
-                            tech_thread.tech_chat_id,
-                            tech_thread.tech_thread_id,
-                        )
-                    except Exception as e:
-                        logger.error(
-                            f"❌ Ошибка переоткрытия тех-топика "
-                            f"{tech_thread.tech_thread_id} в группе {tech_thread.tech_chat_id}: {e}"
-                        )
-
-            # Логируем перед обновлением названий
-            logger.info(f"🔄 Обновление названий топиков для тикета #{ticket.id}")
-            logger.info(f"   Главная группа: {ticket.main_chat_id}/{ticket.main_thread_id}")
-
-            if ticket.assigned_tech_id:
-                tech_name = current_tech.name if current_tech else "?"
-                logger.info(f"   Назначен техник: #{ticket.assigned_tech_id} ({tech_name})")
-            else:
-                logger.info("   Техник не назначен")
-
-            # Обновляем названия топиков
-            await _update_all_topic_titles(bot, ticket, db)
-
-            # Если закрываем - закрываем топики и отправляем опрос
-            if new_status == TicketStatus.CLOSED:
-                # Отправляем опрос клиенту
+                # Главный топик
                 try:
-                    from app.bot.handlers.user_poll import start_feedback_poll
-
-                    await start_feedback_poll(
-                        bot=bot,
-                        user_id=ticket.client_tg_id,
-                        ticket_id=ticket.id,
-                        tech_id=ticket.assigned_tech_id
-                    )
-                    logger.info(f"✅ Опрос отправлен клиенту {ticket.client_tg_id}")
-                except Exception as e:
-                    logger.error(f"❌ Ошибка отправки опроса: {e}")
-
-                # Закрываем топик в главной группе
-                try:
-                    await bot.close_forum_topic(
+                    await bot.reopen_forum_topic(
                         chat_id=ticket.main_chat_id,
                         message_thread_id=ticket.main_thread_id
                     )
-                    logger.info(f"✅ Закрыт топик в главной группе {ticket.main_thread_id}")
-                except Exception as e:
-                    logger.error(f"❌ Ошибка закрытия главного топика: {e}")
+                except TelegramBadRequest:
+                    pass
 
-                # 🔹 Закрываем ВСЕ топики техников для этого клиента
-
-                tech_threads = await get_all_tech_threads_for_ticket(
-                    session=db,
-                    ticket_id=ticket.id
-                )
-
-                for tech_thread in tech_threads:
+                # Тех-топики
+                tech_threads = await get_all_tech_threads_for_ticket(db, ticket.id)
+                for th in tech_threads:
                     try:
-                        await _close_tech_topic(
-                            bot,
-                            tech_thread.tech_chat_id,
-                            tech_thread.tech_thread_id
+                        await bot.reopen_forum_topic(
+                            chat_id=th.tech_chat_id,
+                            message_thread_id=th.tech_thread_id
                         )
-                        logger.info(
-                            f"✅ Закрыт топик техника {tech_thread.tech_thread_id} "
-                            f"в группе {tech_thread.tech_chat_id}"
-                        )
-                    except Exception as e:
-                        logger.error(f"❌ Ошибка закрытия топика техника: {e}")
+                    except TelegramBadRequest:
+                        pass
 
-            status_emoji_map = {
+            # ============================================================
+            # 7. Обновляем РЕАЛЬНО все названия топиков
+            # ============================================================
+            await _update_all_topic_titles(bot, ticket, db)
+
+            # ============================================================
+            # 8. Закрытие тикета
+            # ============================================================
+            if new_status == TicketStatus.CLOSED:
+                # Закрываем главный топик
+                try:
+                    await bot.close_forum_topic(
+                        chat_id=ticket.main_chat_id,
+                        message_thread_id=ticket.main_thread_id,
+                    )
+                except Exception:
+                    pass
+
+                # Закрываем тех-топики
+                tech_threads = await get_all_tech_threads_for_ticket(db, ticket.id)
+                for th in tech_threads:
+                    try:
+                        await bot.close_forum_topic(
+                            chat_id=th.tech_chat_id,
+                            message_thread_id=th.tech_thread_id,
+                        )
+                    except Exception:
+                        pass
+
+            emoji = {
                 TicketStatus.NEW: "🟢",
                 TicketStatus.WORK: "🟡",
                 TicketStatus.CLOSED: "⚪️",
-            }
-
-            await call.answer(f"{status_emoji_map[new_status]} Статус обновлен")
+            }[new_status]
 
         except Exception as e:
-            logger.error(f"❌ Ошибка изменения статуса: {e}", exc_info=True)
+            logger.error(f"❌ Ошибка callback_change_status:", exc_info=True)
             await db.rollback()
-            await call.answer("❌ Произошла ошибка.", show_alert=True)
+            await call.answer("❌ Ошибка.", show_alert=True)
+
 
 # ─────────────────────────────────────────────
 #  Регистрация обработчиков

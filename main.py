@@ -17,6 +17,7 @@ from app.web.server import create_app
 from pathlib import Path
 
 from app.db.database import init_db
+from app.workers.mirror_worker import mirror_worker
 
 async def check_s3_connection(logger: logging.Logger) -> None:
     """Проверка доступности S3-бакета при старте приложения."""
@@ -143,6 +144,11 @@ async def main():
         async with timeline.stage("Настройка бота", "🤖", success_message="Бот настроен") as stage:
             bot, dp = await setup_bot()
             stage.log("Кеш и FSM подготовлены")
+        
+        async with timeline.stage("Создание воркера", "👷‍♂️", success_message="Воркер готов"):
+            asyncio.create_task(mirror_worker())
+            stage.log("Mirror worker запущен")
+
 
         # DEV: polling
         if settings.use_polling or settings.is_dev:

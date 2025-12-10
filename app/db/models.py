@@ -266,6 +266,7 @@ class TechThread(Base):
     )
     tech_chat_id:   Mapped[int] = mapped_column(BigInteger, nullable=False)
     tech_thread_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    tech_thread_name: Mapped[str] = mapped_column(String(256), nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, server_default=now_sql)
 

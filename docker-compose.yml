@@ -13,6 +13,19 @@ services:
       - ./secrets:/secrets:ro
     networks: [appnet]
 
+  worker:
+    build: .
+    container_name: supportbot-worker
+    env_file: [.env]
+    command: python -m app.workers.mirror_worker
+    restart: unless-stopped
+    depends_on:
+      - redis
+      - postgres
+    networks: [appnet]
+    volumes:
+      - ./logs:/app/logs
+
   postgres:
     image: postgres:15
     container_name: supportbot-postgres
@@ -21,18 +34,20 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
-    - ./pgdata:/var/lib/postgresql/data
+      - ./pgdata:/var/lib/postgresql/data
     ports:
-    - "127.0.0.1:5432:5432"
+      - "127.0.0.1:5432:5432"
     restart: unless-stopped
     networks: [appnet]
 
   redis:
     image: redis:7-alpine
     container_name: supportbot-redis
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1000"]
     restart: unless-stopped
     networks: [appnet]
+    ports:
+      - "6379:6379"
 
   caddy:
     image: caddy
@@ -45,6 +60,7 @@ services:
       - caddy_data:/data
       - caddy_config:/config
     networks: [appnet]
+
   backup:
     build:
       context: .
@@ -63,6 +79,7 @@ services:
     depends_on:
       - postgres
     networks: [appnet]
+
 volumes:
   pgdata:
   caddy_data:

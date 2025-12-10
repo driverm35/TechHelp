@@ -1034,7 +1034,7 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
 
                 existing_thread.ticket_id = ticket.id
                 # ✅ ИСПРАВЛЕНО: Обновляем название
-                existing_thread.tech_thread_name = tech_topic_name
+                existing_thread.tech_thread_name = tech_title
                 await db.flush()
 
                 # Переоткрываем топик на всякий случай
@@ -1049,10 +1049,10 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                     await bot.edit_forum_topic(
                         chat_id=existing_thread.tech_chat_id,
                         message_thread_id=tech_thread_id,
-                        name=tech_topic_name,
+                        name=tech_title,
                     )
                     logger.info(
-                        f"✅ Название существующего топика техника обновлено: {tech_topic_name}"
+                        f"✅ Название существующего топика техника обновлено: {tech_title}"
                     )
                 except TelegramBadRequest as e:
                     logger.warning(f"⚠️ Не удалось обновить название тех-топика: {e}")
@@ -1066,7 +1066,7 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                 tech_thread_id = await _create_tech_topic(
                     bot,
                     tech,
-                    tech_topic_name,
+                    tech_title,
                 )
                 if not tech_thread_id:
                     await call.answer(
@@ -1076,14 +1076,14 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                     )
                     return
 
-                # ✅ ИСПРАВЛЕНО: Создаём TechThread с tech_thread_name
+                # ✅ ИСПРАВЛЕНО: Создаём TechThread с tech_title
                 tech_thread = TechThread(
                     ticket_id=ticket.id,
                     user_id=ticket.client_tg_id,
                     tech_id=tech.id,
                     tech_chat_id=tech.group_chat_id,
                     tech_thread_id=tech_thread_id,
-                    tech_thread_name=tech_topic_name,  # ✅ ДОБАВЛЕНО
+                    tech_thread_name=tech_title,  # ✅ ДОБАВЛЕНО
                 )
                 db.add(tech_thread)
                 await db.flush()

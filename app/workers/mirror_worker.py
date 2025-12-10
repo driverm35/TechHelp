@@ -123,18 +123,18 @@ async def process_message(message_id: str, payload: Dict[str, Any]):
         result = await send_payload(bot, payload)
 
         if result is True:
-            logger.debug(f"✅ Отправлено: {payload['type']} → {payload['target_chat_id']}")
+            logger.info(f"✅ Отправлено: {payload['type']} → {payload['target_chat_id']}")
             return True
 
         if result == "fatal":
             await redis_streams.send_to_dlq(payload, "fatal_send_error")
-            logger.error(f"💀 В DLQ: fatal_send_error")
+            logger.info(f"💀 В DLQ: fatal_send_error")
             return True
 
         attempt = payload.get("attempt", 0)
         if attempt >= MAX_RETRIES:
             await redis_streams.send_to_dlq(payload, "max_retries_reached")
-            logger.error(f"💀 В DLQ: max_retries (attempts={attempt})")
+            logger.info(f"💀 В DLQ: max_retries (attempts={attempt})")
             return True
 
         delay = BACKOFF_START * (BACKOFF_BASE ** attempt)

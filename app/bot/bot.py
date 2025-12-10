@@ -12,6 +12,7 @@ from app.bot.middlewares.throttling import ThrottlingMiddleware
 from app.config import settings
 from app.utils.cache import cache
 from app.utils.permissions import is_group_admin
+from app.utils.redis_streams import redis_streams 
 
 from app.bot.handlers import (
     admin,
@@ -35,10 +36,7 @@ async def debug_callback_handler(callback: types.CallbackQuery):
 
 
 class GroupCallbacksGuardMiddleware(BaseMiddleware):
-    """
-    Middleware: запрещает нажимать КАКИЕ-ЛИБО кнопки в группах,
-    если пользователь не админ этой группы.
-    """
+    """Middleware: запрещает нажимать кнопки в группах неадминам."""
 
     async def __call__(
         self,
@@ -46,23 +44,19 @@ class GroupCallbacksGuardMiddleware(BaseMiddleware):
         event: types.CallbackQuery,
         data: Dict[str, Any]
     ) -> Any:
-        # Иногда message может быть None (inline и т.п.)
         if not event.message:
             return await handler(event, data)
 
         chat = event.message.chat
 
-        # Нас интересуют только группы / супергруппы
         if chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
             return await handler(event, data)
 
         bot = data.get("bot")
 
-        # Разрешаем админам этой группы (или глобальным админам)
         if await is_group_admin(bot, chat.id, event.from_user.id):
             return await handler(event, data)
 
-        # Все остальные вообще не проходят дальше
         try:
             await event.answer(
                 "⛔ Только администраторы этой группы могут нажимать эти кнопки.",
@@ -75,8 +69,22 @@ class GroupCallbacksGuardMiddleware(BaseMiddleware):
 
 
 async def setup_bot() -> tuple[Bot, Dispatcher]:
+    """Настройка и инициализация бота."""
 
-    # Подключаем кеш
+    # ✅ 1. Инициализируем Redis Streams
+    try:
+        await redis_streams.connect()
+        await redis_streams.init()
+        logger.info("✅ Redis Streams инициализирован")
+    except Exception as e:
+        logger.error(f"❌ Redis Streams не инициализирован: {e}")
+        # В зависимости от важности - можно raise или продолжить
+        if settings.app_env.lower() in ("prod", "production"):
+            raise
+        else:
+            logger.warning("⚠️ Продолжаем без Redis Streams (DEV режим)")
+
+    # ✅ 2. Подключаем кеш
     try:
         await cache.connect()
         if cache._connected:
@@ -93,6 +101,7 @@ async def setup_bot() -> tuple[Bot, Dispatcher]:
         token=settings.bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML)
     )
+
     # FSM Storage
     storage = None
     if settings.use_redis:
@@ -112,7 +121,6 @@ async def setup_bot() -> tuple[Bot, Dispatcher]:
         storage = MemoryStorage()
         logger.info("ℹ️ Используется MemoryStorage (dev режим)")
 
-
     dp = Dispatcher(storage=storage)
 
     dp.message.middleware(GlobalErrorMiddleware())
@@ -120,7 +128,7 @@ async def setup_bot() -> tuple[Bot, Dispatcher]:
     dp.message.middleware(LoggingMiddleware())
     dp.callback_query.middleware(LoggingMiddleware())
 
-    # Guard для callback в группах - теперь как middleware
+    # Guard для callback в группах
     dp.callback_query.middleware(GroupCallbacksGuardMiddleware())
 
     admin.register_handlers(dp)
@@ -132,16 +140,22 @@ async def setup_bot() -> tuple[Bot, Dispatcher]:
     user_bot.register_handlers(dp)
     service_messages.register_handlers(dp)
 
-
-    logger.info("🛡️ GlobalErrorMiddleware активирован - бот защищен от устаревших callback queries")
-    logger.info("Бот успешно настроен")
+    logger.info("🛡️ GlobalErrorMiddleware активирован")
+    logger.info("✅ Бот успешно настроен")
 
     return bot, dp
 
 
 async def shutdown_bot():
+    """Корректное завершение работы бота."""
+    try:
+        await redis_streams.disconnect()
+        logger.info("✅ Redis Streams отключен")
+    except Exception as e:
+        logger.error(f"❌ Ошибка отключения Redis Streams: {e}")
+
     try:
         await cache.close()
-        logger.info("Соединения с кешем закрыты")
+        logger.info("✅ Соединения с кешем закрыты")
     except Exception as e:
-        logger.error(f"Ошибка закрытия кеша: {e}")
+        logger.error(f"❌ Ошибка закрытия кеша: {e}")

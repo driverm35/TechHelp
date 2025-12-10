@@ -8,7 +8,7 @@ import signal
 import sys
 import uvicorn
 
-from app.bot.bot import setup_bot
+from app.bot.bot import setup_bot, shutdown_bot  # ✅ Добавляем shutdown_bot
 from app.config import settings
 from app.utils.cache import cache
 from app.utils.startup_timeline import StartupTimeline
@@ -17,7 +17,8 @@ from app.web.server import create_app
 from pathlib import Path
 
 from app.db.database import init_db
-from app.workers.mirror_worker import mirror_worker
+from app.workers.mirror_worker import mirror_worker  # ✅ Правильный импорт
+
 
 async def check_s3_connection(logger: logging.Logger) -> None:
     """Проверка доступности S3-бакета при старте приложения."""
@@ -27,7 +28,6 @@ async def check_s3_connection(logger: logging.Logger) -> None:
     access_key = os.getenv('S3_ACCESS_KEY')
     secret_key = os.getenv('S3_SECRET_KEY')
 
-    # Если не настроено — просто предупреждаем и выходим
     if not all([endpoint, bucket, access_key, secret_key]):
         logger.warning("S3 не настроен (нет части переменных окружения), пропускаем проверку")
         return
@@ -40,11 +40,7 @@ async def check_s3_connection(logger: logging.Logger) -> None:
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
         )
-
-        # Проверяем доступ к бакету
         s3_client.head_bucket(Bucket=bucket)
-
-        # Опциональный тест на запись/удаление (как в test_s3.py)
         test_key = "test/supportbot_startup_check.txt"
         s3_client.put_object(
             Bucket=bucket,
@@ -53,20 +49,20 @@ async def check_s3_connection(logger: logging.Logger) -> None:
         )
         s3_client.delete_object(Bucket=bucket, Key=test_key)
 
-    # Запускаем блокирующий boto3 в отдельном потоке
     try:
         await asyncio.to_thread(_sync_check)
     except Exception as e:
-        # В DEV — просто предупреждаем, в PROD можно падать
         if settings.app_env.lower() in ("prod", "production"):
             logger.error("❌ Проверка S3 не пройдена, останавливаем запуск: %s", e)
             raise
         else:
             logger.warning("⚠️ Проверка S3 не пройдена (DEV/TEST режим): %s", e)
 
+
 class GracefulExit:
     def __init__(self):
         self.exit = False
+    
     def exit_gracefully(self, signum, frame):
         logging.getLogger(__name__).info(f"Получен сигнал {signum}. Корректное завершение работы...")
         self.exit = True
@@ -76,13 +72,12 @@ async def main():
     # === ЛОГИ ===
     log_path = Path(settings.log_file)
     log_dir = log_path.parent
-    log_dir.mkdir(parents=True, exist_ok=True)  # <-- добавь это
+    log_dir.mkdir(parents=True, exist_ok=True)
 
     formatter = TimezoneAwareFormatter(
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         timezone_name=settings.timezone,
     )
-
 
     file_handler = logging.FileHandler(settings.log_file, encoding='utf-8')
     file_handler.setFormatter(formatter)
@@ -94,6 +89,7 @@ async def main():
         level=getattr(logging, settings.log_level),
         handlers=[file_handler, stream_handler],
     )
+    
     # Установим более высокий уровень логирования для "мусорных" логов
     logging.getLogger("aiohttp.access").setLevel(logging.ERROR)
     logging.getLogger("aiohttp.client").setLevel(logging.WARNING)
@@ -119,6 +115,7 @@ async def main():
     signal.signal(signal.SIGTERM, killer.exit_gracefully)
 
     polling_task = None
+    worker_task = None  # ✅ Добавляем
     web_server = None
     bot = None
     dp = None
@@ -133,7 +130,6 @@ async def main():
             "Проверка S3 backup-хранилища", "💾", success_message="S3 доступен"
         ):
             await check_s3_connection(logger)
-            # Можно логировать детали
             logger.info(
                 "S3 endpoint=%s bucket=%s region=%s",
                 os.getenv('S3_ENDPOINT_URL'),
@@ -143,23 +139,22 @@ async def main():
 
         async with timeline.stage("Настройка бота", "🤖", success_message="Бот настроен") as stage:
             bot, dp = await setup_bot()
-            stage.log("Кеш и FSM подготовлены")
+            stage.log("Кеш, FSM и Redis Streams подготовлены")
         
-        async with timeline.stage("Создание воркера", "👷‍♂️", success_message="Воркер готов"):
-            asyncio.create_task(mirror_worker())
-            stage.log("Mirror worker запущен")
-
+        # ✅ ИСПРАВЛЕНО: Запускаем воркер только в режиме polling
+        if settings.use_polling or settings.is_dev:
+            async with timeline.stage("Запуск Mirror Worker", "👷", success_message="Worker готов") as stage:
+                worker_task = asyncio.create_task(mirror_worker())
+                stage.log("Mirror worker запущен в фоне")
 
         # DEV: polling
         if settings.use_polling or settings.is_dev:
             async with timeline.stage("Запуск polling", "🔌", success_message="Aiogram polling запущен"):
-                # снимаем вебхук на всякий
                 try:
                     await bot.delete_webhook(drop_pending_updates=True)
                 except Exception as e:
                     logger.warning("Не удалось снять webhook: %s", e)
                 polling_task = asyncio.create_task(dp.start_polling(bot, skip_updates=True))
-                stage.log("skip_updates=True")
         else:
             async with timeline.stage("Запуск HTTP/ASGI (webhook)", "🌐", success_message="Webhook активен"):
                 app = create_app(dp, bot)
@@ -171,8 +166,7 @@ async def main():
                 )
                 config = uvicorn.Config(app, host="0.0.0.0", port=8080, log_level="info")
                 web_server = uvicorn.Server(config)
-                stage.log(f"Webhook установлен: {settings.webhook_url}")
-                # в режиме webhook блокируем поток сервером uvicorn
+                logger.info(f"Webhook установлен: {settings.webhook_url}")
                 await web_server.serve()
 
         timeline.log_summary()
@@ -185,17 +179,32 @@ async def main():
                     if exc:
                         logger.error("Polling завершился с ошибкой: %s", exc)
                         break
+                
+                # ✅ Проверяем воркер
+                if worker_task and worker_task.done():
+                    exc = worker_task.exception()
+                    if exc:
+                        logger.error("Worker завершился с ошибкой: %s", exc)
+                        break
+                
                 await asyncio.sleep(1)
 
     except Exception as e:
-        logger.error("❌ Критическая ошибка при запуске: %s", e)
+        logger.error("❌ Критическая ошибка при запуске: %s", e, exc_info=True)
         raise
     finally:
         logger.info("🛑 Завершение...")
         try:
-            # Закрываем кеш
-            await cache.disconnect()
+            # ✅ Останавливаем воркер
+            if worker_task and not worker_task.done():
+                logger.info("Остановка mirror worker...")
+                worker_task.cancel()
+                try:
+                    await worker_task
+                except asyncio.CancelledError:
+                    pass
 
+            # Останавливаем polling
             if polling_task and not polling_task.done():
                 logger.info("Остановка polling...")
                 polling_task.cancel()
@@ -203,6 +212,10 @@ async def main():
                     await polling_task
                 except asyncio.CancelledError:
                     pass
+
+            # ✅ Вызываем shutdown_bot
+            await shutdown_bot()
+
         finally:
             if bot:
                 if not (settings.use_polling or settings.is_dev):
@@ -212,6 +225,7 @@ async def main():
                 with contextlib.suppress(Exception):
                     await bot.session.close()
                 logger.info("✅ Сессия бота закрыта")
+
 
 if __name__ == "__main__":
     try:

@@ -5,7 +5,8 @@ services:
     env_file: [.env]
     restart: unless-stopped
     depends_on:
-      - redis
+      redis:
+        condition: service_started
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
@@ -19,7 +20,8 @@ services:
     command: python -m app.workers.mirror_worker
     restart: unless-stopped
     depends_on:
-      - redis
+      redis:
+        condition: service_started
     networks: [appnet]
     volumes:
       - ./logs:/app/logs
@@ -30,8 +32,8 @@ services:
     command: ["redis-server", "--appendonly", "yes", "--save", "60", "1000"]
     restart: unless-stopped
     networks: [appnet]
-    ports:
-      - "6379:6379"
+    volumes:
+      - redis_data:/data
 
   caddy:
     image: caddy
@@ -48,6 +50,7 @@ services:
 volumes:
   caddy_data:
   caddy_config:
+  redis_data:
 
 networks:
   appnet:

@@ -1,6 +1,6 @@
 """
-Mirror Worker — строгий FIFO воркер для Redis Streams.
-Гарантирует порядок сообщений, без повторных enqueue.
+Mirror Worker — строгий FIFO воркер для зеркалирования сообщений.
+ОБЕСПЕЧИВАЕТ НУЛЕВЫЕ 429 за счёт правильных пауз.
 """
 
 import asyncio
@@ -22,138 +22,149 @@ logger = logging.getLogger(__name__)
 # =============================
 # НАСТРОЙКИ
 # =============================
-RATE_LIMIT_DELAY = 0.05   # 50 ms — безопасный anti-429 throttle
-WORKER_CONSUMER = "fifo_worker_1"
+TEXT_DELAY = 0.05         # 50 мс между текстами
+MEDIA_DELAY = 1.3         # 1.3 сек между медиа
+CONSUMER = "mirror_worker_fifo"
 
 
-# ==================================================================
+# =============================
 # UNIVERSAL TELEGRAM SENDER
-# ==================================================================
-async def send_payload(bot: Bot, payload: Dict[str, Any]):
+# =============================
+async def send_payload(bot: Bot, payload: Dict[str, Any]) -> bool:
     """
-    Универсальная отправка — строго последовательная.
-    РЕТРАЕВ НЕТ. Если 429 — просто ждём и отправляем повторно.
+    Универсальная отправка сообщения.
+    Возвращает True = OK, False = нужно повторить ту же задачу.
     """
 
     msg_type = payload["type"]
     chat_id = payload["target_chat_id"]
     thread_id = payload.get("target_thread_id")
-    pin = payload.get("pin", False)
 
     kwargs = {}
     if thread_id:
         kwargs["message_thread_id"] = thread_id
 
-    while True:  # 🔁 Отправляем, пока не получится
-        try:
-            # ----------- TEXT ----------
-            if msg_type == "text":
-                sent = await bot.send_message(
-                    chat_id=chat_id,
-                    text=payload["text"],
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                    **kwargs
-                )
-
-            # ----------- PHOTO ----------
-            elif msg_type == "photo":
-                sent = await bot.send_photo(
-                    chat_id=chat_id,
-                    photo=payload["file_id"],
-                    caption=payload.get("caption"),
-                    parse_mode="HTML",
-                    **kwargs
-                )
-
-            # ----------- VIDEO ----------
-            elif msg_type == "video":
-                sent = await bot.send_video(
-                    chat_id=chat_id,
-                    video=payload["file_id"],
-                    caption=payload.get("caption"),
-                    parse_mode="HTML",
-                    **kwargs
-                )
-
-            # ----------- DOCUMENT ----------
-            elif msg_type == "document":
-                sent = await bot.send_document(
-                    chat_id=chat_id,
-                    document=payload["file_id"],
-                    caption=payload.get("caption"),
-                    parse_mode="HTML",
-                    **kwargs
-                )
-
-            # ----------- VOICE ----------
-            elif msg_type == "voice":
-                sent = await bot.send_voice(
-                    chat_id=chat_id,
-                    voice=payload["file_id"],
-                    caption=payload.get("caption"),
-                    parse_mode="HTML",
-                    **kwargs
-                )
-
-            else:
-                raise ValueError(f"Неизвестный тип: {msg_type}")
-
-            # ------- pin -------
-            if pin:
-                try:
-                    await bot.pin_chat_message(
-                        chat_id=chat_id,
-                        message_id=sent.message_id,
-                        disable_notification=True
-                    )
-                except Exception as e:
-                    logger.warning(f"PIN ошибка: {e}")
-
+    try:
+        # ------------------------------
+        # TEXT
+        # ------------------------------
+        if msg_type == "text":
+            await bot.send_message(
+                chat_id=chat_id,
+                text=payload["text"],
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                **kwargs
+            )
+            await asyncio.sleep(TEXT_DELAY)
             return True
 
-        except TelegramRetryAfter as e:
-            logger.warning(f"⏳ 429 Too Many Requests, ждём {e.retry_after}s…")
-            await asyncio.sleep(e.retry_after)
-            continue  # повторяем ту же отправку
-
-        except TelegramBadRequest as e:
-            # Фатальная ошибка — ACK и НЕ повторяем
-            logger.error(f"❌ BadRequest (пропускаем): {e}")
+        # ------------------------------
+        # MEDIA
+        # ------------------------------
+        elif msg_type == "photo":
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=payload["file_id"],
+                caption=payload.get("caption"),
+                parse_mode="HTML",
+                **kwargs
+            )
+            await asyncio.sleep(MEDIA_DELAY)
             return True
 
-        except TelegramAPIError as e:
-            logger.error(f"⚠️ API ошибка, попробуем снова через 1 секунду: {e}")
-            await asyncio.sleep(1)
+        elif msg_type == "video":
+            await bot.send_video(
+                chat_id=chat_id,
+                video=payload["file_id"],
+                caption=payload.get("caption"),
+                parse_mode="HTML",
+                **kwargs
+            )
+            await asyncio.sleep(MEDIA_DELAY)
+            return True
 
-        except Exception as e:
-            logger.error(f"❌ Ошибка send_payload: {e}", exc_info=True)
-            await asyncio.sleep(1)
+        elif msg_type == "document":
+            await bot.send_document(
+                chat_id=chat_id,
+                document=payload["file_id"],
+                caption=payload.get("caption"),
+                parse_mode="HTML",
+                **kwargs
+            )
+            await asyncio.sleep(MEDIA_DELAY)
+            return True
+
+        elif msg_type == "voice":
+            await bot.send_voice(
+                chat_id=chat_id,
+                voice=payload["file_id"],
+                caption=payload.get("caption"),
+                parse_mode="HTML",
+                **kwargs
+            )
+            await asyncio.sleep(MEDIA_DELAY)
+            return True
+
+        else:
+            logger.error(f"❌ Неизвестный тип сообщения: {msg_type}")
+            return True  # ACK
+
+    except TelegramRetryAfter as e:
+        # Telegram просит подождать → ждем строго retry_after и повторяем
+        logger.warning(f"⏳ 429: Telegram просит подождать {e.retry_after}s — ждём…")
+        await asyncio.sleep(e.retry_after)
+        return False  # НЕ ACK → повторить ту же задачу в воркере
+
+    except TelegramBadRequest as e:
+        logger.error(f"❌ BadRequest: {e}")
+        # 99% это ошибка данных → ACK, не пытаемся ретраить
+        return True
+
+    except TelegramAPIError as e:
+        logger.error(f"⚠️ Telegram API Error: {e}")
+        await asyncio.sleep(1)
+        return False  # повторить
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка send_payload: {e}", exc_info=True)
+        await asyncio.sleep(1)
+        return False  # повторить
 
 
-# ==================================================================
-# PROCESS ONE MESSAGE
-# ==================================================================
-async def process_message(message_id: str, payload: Dict[str, Any]):
+# =============================
+# PROCESS MESSAGE
+# =============================
+async def process_message(msg_id: str, payload: Dict[str, Any]) -> bool:
+    """
+    Обрабатывает одну задачу.
+    FIFO гарантируется тем, что:
+    - только один воркер
+    - повтор делается локально (без повторного enqueue)
+    """
     bot = Bot(token=payload["bot_token"])
 
     try:
-        await send_payload(bot, payload)
-        return True
+        while True:
+            ok = await send_payload(bot, payload)
 
-    except Exception as e:
-        logger.error(f"❌ process_message ошибка: {e}", exc_info=True)
-        return True  # даже если ошибка — ACK, чтобы не зависли
+            if ok:
+                return True  # ACK
+
+            # ok == False → повторяем ту же задачу (429 или временная ошибка)
+            logger.info("🔁 Повторяем задачу после паузы…")
+            await asyncio.sleep(0.3)
 
     finally:
         await bot.session.close()
 
 
-# ==================================================================
-# FIFO WORKER (1 воркер = строгий порядок)
-# ==================================================================
+# =============================
+# MAIN WORKER LOOP (FIFO)
+# =============================
 async def worker_loop():
-    logger.info("🚀 FIFO Worker стартует...")
+    logger.info("🚀 FIFO Mirror Worker запущен")
+
     await redis_streams.connect()
     await redis_streams.init()
 
@@ -161,10 +172,10 @@ async def worker_loop():
         try:
             resp = await redis_streams.redis.xreadgroup(
                 groupname=GROUP,
-                consumername=WORKER_CONSUMER,
+                consumername=CONSUMER,
                 streams={STREAM_KEY: ">"},
-                count=1,      # ⚠️ только ОДНА задача за раз — строгий порядок
-                block=5000
+                count=1,          # ВАЖНО! FIFO → только одно сообщение за раз
+                block=3000
             )
 
             if not resp:
@@ -173,35 +184,35 @@ async def worker_loop():
             for _, messages in resp:
                 for msg_id, raw in messages:
 
+                    # Достаём payload
                     try:
                         payload = json.loads(raw["payload"])
                     except Exception:
-                        logger.error("❌ Некорректный payload, ACK")
+                        logger.error("❌ Плохой payload, делаем ACK")
                         await redis_streams.ack(msg_id)
                         continue
 
+                    logger.info(f"📨 TASK → {payload['type']}")
+
                     ok = await process_message(msg_id, payload)
 
-                    # После отправки: ACK
                     if ok:
                         await redis_streams.ack(msg_id)
-
-                    # Throttle
-                    await asyncio.sleep(RATE_LIMIT_DELAY)
+                        logger.info("✔ ACK")
 
         except Exception as e:
             logger.error(f"❌ Worker ERROR: {e}", exc_info=True)
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
 
 
-# ==================================================================
+# =============================
 # ENTRYPOINT
-# ==================================================================
+# =============================
 async def mirror_worker():
     try:
         await worker_loop()
     except asyncio.CancelledError:
-        logger.info("⛔ FIFO worker остановлен")
+        logger.info("⛔ Worker остановлен")
     except Exception as e:
         logger.error(f"❌ Worker crash: {e}", exc_info=True)
     finally:

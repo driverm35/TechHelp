@@ -3,41 +3,34 @@ import json
 import logging
 from typing import Dict, Any
 
-import aiohttp
-
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+import aioredis
 from aiogram import Bot
-from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest, TelegramAPIError
+from aiogram.exceptions import (
+    TelegramRetryAfter,
+    TelegramBadRequest,
+    TelegramAPIError,
+)
 
 from app.utils.redis_streams import redis_streams, STREAM_KEY, GROUP, MAX_RETRIES
 
 logger = logging.getLogger(__name__)
 
-CONSUMER = "worker-1"
-BACKOFF_BASE = 1.5             # коэффициент экспоненциальной задержки
-BACKOFF_START = 1.0            # секунды
+CONSUMER = "mirror_worker_1"
+
+BACKOFF_BASE = 1.8       # коэффициент экспоненциальной задержки
+BACKOFF_START = 1.0      # стартовая задержка в секундах
 
 
-# ─────────────────────────────────────────────────────────────
-#  Health-check API (FastAPI)
-# ─────────────────────────────────────────────────────────────
-app = FastAPI(title="Mirror Worker")
-
-
-@app.get("/health")
-async def health():
-    stats = await redis_streams.health()
-    return JSONResponse({
-        "status": "ok",
-        "stats": stats
-    })
-
-
-# ─────────────────────────────────────────────────────────────
-#  UNIVERSAL SENDER — отправляет ВСЕ типы сообщений
-# ─────────────────────────────────────────────────────────────
+# ==================================================================
+# UNIVERSAL TELEGRAM SENDER — отправляет ВСЕ типы сообщений
+# ==================================================================
 async def send_payload(bot: Bot, payload: Dict[str, Any]):
+    """
+    Универсальная отправка сообщения любого типа.
+    Поддерживает:
+    text / photo / video / document / voice
+    """
+
     msg_type = payload["type"]
     chat_id = payload["target_chat_id"]
     thread_id = payload.get("target_thread_id")
@@ -47,11 +40,12 @@ async def send_payload(bot: Bot, payload: Dict[str, Any]):
     if thread_id:
         kwargs["message_thread_id"] = thread_id
 
-    sent_message = None
+    sent = None
 
     try:
+        # TEXT
         if msg_type == "text":
-            sent_message = await bot.send_message(
+            sent = await bot.send_message(
                 chat_id=chat_id,
                 text=payload["text"],
                 parse_mode="HTML",
@@ -59,8 +53,9 @@ async def send_payload(bot: Bot, payload: Dict[str, Any]):
                 **kwargs
             )
 
+        # PHOTO
         elif msg_type == "photo":
-            sent_message = await bot.send_photo(
+            sent = await bot.send_photo(
                 chat_id=chat_id,
                 photo=payload["file_id"],
                 caption=payload.get("caption"),
@@ -68,8 +63,9 @@ async def send_payload(bot: Bot, payload: Dict[str, Any]):
                 **kwargs
             )
 
+        # VIDEO
         elif msg_type == "video":
-            sent_message = await bot.send_video(
+            sent = await bot.send_video(
                 chat_id=chat_id,
                 video=payload["file_id"],
                 caption=payload.get("caption"),
@@ -77,8 +73,9 @@ async def send_payload(bot: Bot, payload: Dict[str, Any]):
                 **kwargs
             )
 
+        # DOCUMENT
         elif msg_type == "document":
-            sent_message = await bot.send_document(
+            sent = await bot.send_document(
                 chat_id=chat_id,
                 document=payload["file_id"],
                 caption=payload.get("caption"),
@@ -86,8 +83,9 @@ async def send_payload(bot: Bot, payload: Dict[str, Any]):
                 **kwargs
             )
 
+        # VOICE
         elif msg_type == "voice":
-            sent_message = await bot.send_voice(
+            sent = await bot.send_voice(
                 chat_id=chat_id,
                 voice=payload["file_id"],
                 caption=payload.get("caption"),
@@ -95,30 +93,31 @@ async def send_payload(bot: Bot, payload: Dict[str, Any]):
                 **kwargs
             )
 
+        # UNKNOWN TYPE
         else:
-            raise ValueError(f"Неизвестный тип сообщения: {msg_type}")
+            raise ValueError(f"Неизвестный msg_type: {msg_type}")
 
         # PIN
-        if pin and sent_message:
+        if sent and pin:
             try:
                 await bot.pin_chat_message(
                     chat_id=chat_id,
-                    message_id=sent_message.message_id,
+                    message_id=sent.message_id,
                     disable_notification=True
                 )
-            except TelegramBadRequest as e:
-                logger.warning(f"PIN error: {e}")
+            except Exception as e:
+                logger.warning(f"PIN ошибка: {e}")
 
         return True
 
+    # Telegram просит подождать (rate limit)
     except TelegramRetryAfter as e:
-        # Telegram просит подождать
         logger.warning(f"429 RETRY AFTER {e.retry_after}s")
         await asyncio.sleep(e.retry_after)
         return False
 
     except TelegramBadRequest as e:
-        # Нельзя отправить — это не временная ошибка
+        # ошибка отправки — не retryable
         logger.error(f"BadRequest → {e}")
         return "fatal"
 
@@ -127,91 +126,98 @@ async def send_payload(bot: Bot, payload: Dict[str, Any]):
         return False
 
     except Exception as e:
-        logger.error(f"Unknown error: {e}")
+        logger.error(f"send_payload error: {e}")
         return False
 
 
-# ─────────────────────────────────────────────────────────────
-#  PROCESS MESSAGE (main handler)
-# ─────────────────────────────────────────────────────────────
-async def process_message(message_id: str, payload: Dict[str, Any]) -> bool:
+# ==================================================================
+# PROCESS ONE MESSAGE
+# ==================================================================
+async def process_message(message_id: str, payload: Dict[str, Any]):
     bot = Bot(token=payload["bot_token"])
 
     result = await send_payload(bot, payload)
 
+    # Успех → ACK
     if result is True:
         return True
 
-    retry = payload.get("attempt", 0)
-
+    # Фатальная ошибка → DLQ
     if result == "fatal":
-        await redis_streams.send_to_dlq(payload, "fatal_error")
+        await redis_streams.send_to_dlq(payload, "fatal_send_error")
         return True
 
-    if retry >= MAX_RETRIES:
-        await redis_streams.send_to_dlq(payload, "max_retries_exceeded")
+    # RETRY
+    attempt = payload.get("attempt", 0)
+
+    if attempt >= MAX_RETRIES:
+        await redis_streams.send_to_dlq(payload, "max_retries_reached")
         return True
 
-    # RETRY с экспоненциальной задержкой
-    retry_delay = BACKOFF_START * (BACKOFF_BASE ** retry)
-    await asyncio.sleep(retry_delay)
+    # Экспоненциальная задержка
+    delay = BACKOFF_START * (BACKOFF_BASE ** attempt)
+    logger.info(f"🔁 RETRY attempt={attempt+1}, delay={delay:.2f}s")
 
-    payload["attempt"] = retry + 1
+    await asyncio.sleep(delay)
+
+    payload["attempt"] = attempt + 1
     await redis_streams.enqueue(payload)
 
-    logger.info(f"🔁 RETRY #{retry+1} для payload {payload}")
     return True
 
 
-# ─────────────────────────────────────────────────────────────
-#  WORKER LOOP
-# ─────────────────────────────────────────────────────────────
+# ==================================================================
+# MAIN WORKER LOOP
+# ==================================================================
 async def worker_loop():
     redis = redis_streams.redis
 
-    logger.info("🚀 Worker started")
+    logger.info("🚀 Mirror Worker запущен")
+
+    # создаём группу, если нет
+    await redis_streams.init()
 
     while True:
         try:
-            # читаем сообщения из pending + новые
-            response = await redis.xreadgroup(
+            # читаем pending + новые сообщения
+            resp = await redis.xreadgroup(
                 groupname=GROUP,
                 consumername=CONSUMER,
                 streams={STREAM_KEY: ">"},
-                count=10,
-                block=3000
+                count=20,
+                block=3000  # 3 секунды
             )
 
-            if not response:
+            if not resp:
                 continue
 
-            for stream_key, messages in response:
-                for mid, data in messages:
+            for stream, messages in resp:
+                for msg_id, fields in messages:
 
                     try:
-                        payload = json.loads(data["payload"])
-                    except Exception:
-                        logger.error(f"Некорректный payload: {data}")
-                        await redis_streams.ack(mid)
+                        payload = json.loads(fields["payload"])
+                    except Exception as e:
+                        logger.error(f"Некорректный payload: {fields}")
+                        await redis_streams.ack(msg_id)
                         continue
 
-                    ok = await process_message(mid, payload)
+                    ok = await process_message(msg_id, payload)
 
                     if ok:
-                        await redis_streams.ack(mid)
+                        await redis_streams.ack(msg_id)
 
         except Exception as e:
-            logger.error(f"Worker error: {e}", exc_info=True)
+            logger.error(f"WorkerLoop ERROR: {e}", exc_info=True)
             await asyncio.sleep(2)
 
 
-# ─────────────────────────────────────────────────────────────
-#  ENTRYPOINT
-# ─────────────────────────────────────────────────────────────
+# ==================================================================
+# ENTRYPOINT
+# ==================================================================
 if __name__ == "__main__":
-    import uvicorn
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    )
 
-    loop = asyncio.get_event_loop()
-    loop.create_task(worker_loop())
-
-    uvicorn.run(app, host="0.0.0.0", port=8081)
+    asyncio.run(worker_loop())

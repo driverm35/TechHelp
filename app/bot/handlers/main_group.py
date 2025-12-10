@@ -18,7 +18,6 @@ from app.db.models import Ticket, TechThread, TicketStatus, Technician
 from app.db.crud.ticket import get_all_tech_threads_for_ticket
 from app.db.crud.tech import get_technicians, get_technician_by_id
 from app.db.crud.user import get_or_create_user
-from app.queue.mirror_queue import MirrorQueue
 from app.utils.cache import cache
 from app.utils.redis_streams import redis_streams
 

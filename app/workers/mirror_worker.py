@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # НАСТРОЙКИ ПРОИЗВОДИТЕЛЬНОСТИ
 # =============================
 WORKER_COUNT = 5
-RATE_LIMIT_DELAY = 0.05   # 50 ms между отправками чтобы избегать 429
+RATE_LIMIT_DELAY = 0.1   # 100 ms между отправками чтобы избегать 429
 BACKOFF_BASE = 1.8
 BACKOFF_START = 1.0
 

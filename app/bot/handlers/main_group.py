@@ -1,4 +1,5 @@
 # app/bot/handlers/main_group.py
+
 from __future__ import annotations
 import logging
 
@@ -14,10 +15,18 @@ from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.db.database import db_manager
-from app.db.models import Ticket, TechThread, TicketStatus, Technician
-from app.db.crud.ticket import get_all_tech_threads_for_ticket
-from app.db.crud.tech import get_technicians, get_technician_by_id
+from app.db.models import Ticket, TechThread, TicketStatus, Technician, User
+from app.db.crud.ticket import (
+    get_all_tech_threads_for_ticket,
+    get_tech_thread_by_user_and_tech,
+    add_event,
+)
+from app.db.crud.tech import (
+    get_technicians,
+    get_technician_by_id,
+)
 from app.db.crud.user import get_or_create_user
+from app.db.crud.message import TicketMessageCRUD
 from app.utils.cache import cache
 from app.utils.redis_streams import redis_streams
 

@@ -56,51 +56,35 @@ def _status_emoji(status: TicketStatus) -> str:
     }.get(status, "⚪️")
 
 
-def _build_topic_title(
-    status: TicketStatus,
-    client_name: str,
-    client_username: str | None = None,
-    tech_tag: str | None = None,
-) -> str:
+def _build_topic_title(user: User, status: TicketStatus, assigned: bool) -> str:
     """
-    Построить название топика по единому шаблону.
-
-    Args:
-        status: Статус тикета
-        client_name: Имя клиента
-        client_username: Username клиента
-        tech_tag: Тег техника (только для главной группы)
-
-    Returns:
-        Название топика
-
-    Примеры:
-        - Главная группа: "🟢 [ПВЛ] Иван (@ivan)"
-        - Группа техника: "🟢 Иван (@ivan)"
-        - Без техника: "🟢 [-] Иван (@ivan)"
+    Имя топика:
+      🟢 [-] Имя (@username)  - если не назначен
+      🟢 Имя (@username)      - если назначен техник
     """
-    emoji = _status_emoji(status)
+    parts: list[str] = [_status_emoji(status)]
+    
+    if not assigned:
+        parts.append("[-]")
 
-    parts = [emoji]
+    name_bits: list[str] = []
+    if user.first_name:
+        name_bits.append(user.first_name)
+    if user.last_name:
+        name_bits.append(user.last_name)
+    title = " ".join(name_bits) or user.username or str(user.tg_id)
 
-    # Добавляем тег (для главной группы)
-    if tech_tag is not None:
-        parts.append(f"[{tech_tag}]")
+    parts.append(title)
+    if user.username:
+        parts.append(f"(@{user.username})")
 
-    # Имя клиента
-    parts.append(client_name)
-
-    # Username если есть
-    if client_username:
-        parts.append(f"(@{client_username})")
-
-    title = " ".join(parts)
-
+    full_title = " ".join(parts)
+    
     # Telegram ограничивает 128 символов
-    if len(title) > 128:
-        title = title[:125] + "..."
-
-    return title
+    if len(full_title) > 128:
+        full_title = full_title[:125] + "..."
+    
+    return full_title
 
 
 def _get_status_control_keyboard(ticket_id: int) -> InlineKeyboardMarkup:
@@ -927,8 +911,10 @@ async def cmd_tech(message: Message, bot: Bot) -> None:
 #  Callback: назначение техника
 # ─────────────────────────────────────────────
 
+# app/bot/handlers/main_group.py
+
 async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
-    """Обработка назначения техника на тикет (с переназначением зеркалирования и переименованием топиков)."""
+    """Обработка назначения техника на тикет."""
     if not settings.is_admin(call.from_user.id):
         await call.answer("⛔ Нет прав", show_alert=True)
         return
@@ -944,9 +930,7 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
 
     async with db_manager.session() as db:
         try:
-            from app.db.crud.ticket import get_tech_thread_by_user_and_tech
-
-            # Загружаем тикет с клиентом и текущим техником
+            # Загружаем тикет с клиентом и техником
             stmt = (
                 select(Ticket)
                 .options(
@@ -975,7 +959,7 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                 )
                 return
 
-            # Если уже этот техник — ничего не делаем
+            # Если уже стоит техник — ничего не делаем
             if ticket.assigned_tech_id == tech_id:
                 await call.answer("✅ Этот техник уже назначен", show_alert=False)
                 return
@@ -993,12 +977,11 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
             client_username = ticket.client.username
             tag = _extract_consonants(tech.name)
 
-            # Название для топика техника (без тега)
+            # ✅ ИСПРАВЛЕНО: Формируем название топика техника (БЕЗ тега)
             tech_topic_name = _build_topic_title(
+                user=ticket.client,
                 status=ticket.status,
-                client_name=client_name,
-                client_username=client_username,
-                tech_tag=None,
+                assigned=True  # у техника всегда assigned=True
             )
 
             # 1) Отключаем зеркалирование от прежнего техника (если был)
@@ -1009,7 +992,6 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                     ticket.assigned_tech_id,
                 )
                 if old_thread:
-                    # закрываем старый тех-топик и удаляем запись
                     await _close_tech_topic(
                         bot,
                         old_thread.tech_chat_id,
@@ -1022,8 +1004,6 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                     )
 
             # 2) Ищем/создаём тех-топик для НОВОГО техника
-            #   — логика: один тех-топик на связку (клиент, техник),
-            #     при новом тикете — просто "перепривязываем" его.
             existing_thread = await get_tech_thread_by_user_and_tech(
                 session=db,
                 user_id=ticket.client_tg_id,
@@ -1037,6 +1017,8 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                 tech_thread_id = existing_thread.tech_thread_id
 
                 existing_thread.ticket_id = ticket.id
+                # ✅ ИСПРАВЛЕНО: Обновляем название
+                existing_thread.tech_thread_name = tech_topic_name
                 await db.flush()
 
                 # Переоткрываем топик на всякий случай
@@ -1078,43 +1060,81 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                     )
                     return
 
+                # ✅ ИСПРАВЛЕНО: Создаём TechThread с tech_thread_name
                 tech_thread = TechThread(
                     ticket_id=ticket.id,
                     user_id=ticket.client_tg_id,
                     tech_id=tech.id,
                     tech_chat_id=tech.group_chat_id,
                     tech_thread_id=tech_thread_id,
+                    tech_thread_name=tech_topic_name,  # ✅ ДОБАВЛЕНО
                 )
                 db.add(tech_thread)
                 await db.flush()
 
                 # Копируем историю тикета в новый тех-топик
                 try:
-                    copied = await _copy_ticket_history_to_tech(bot, ticket.id, tech_thread.tech_chat_id, tech_thread.tech_thread_id, db)
-                    logger.info(
-                        f"📋 Скопировано {copied} сообщений в новый топик техника "
-                        f"(тикет #{ticket.id}, техник {tech.id})"
+                    # Перезагружаем тикет с messages
+                    stmt_with_messages = (
+                        select(Ticket)
+                        .options(
+                            selectinload(Ticket.client),
+                            selectinload(Ticket.messages),
+                        )
+                        .where(Ticket.id == ticket.id)
                     )
+                    result = await db.execute(stmt_with_messages)
+                    ticket_with_messages = result.scalar_one_or_none()
+
+                    if ticket_with_messages:
+                        copied = await _copy_ticket_history_to_tech(
+                            bot=bot,
+                            ticket=ticket_with_messages,
+                            tech_chat_id=tech.group_chat_id,
+                            tech_thread_id=tech_thread_id,
+                            db=db,
+                        )
+                        logger.info(
+                            f"📋 Скопировано {copied} сообщений в новый топик техника "
+                            f"(тикет #{ticket.id}, техник {tech.id})"
+                        )
                 except Exception as e:
                     logger.error(f"❌ Ошибка копирования истории: {e}")
 
-                # Отправляем и закрепляем кнопки статуса в тех-топике
+                # Отправляем кнопки статуса в тех-топик
                 try:
+                    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+                    status_kb = InlineKeyboardMarkup(
+                        inline_keyboard=[[
+                            InlineKeyboardButton(
+                                text="🟡 В работе",
+                                callback_data=f"status_work:{ticket.id}",
+                            ),
+                            InlineKeyboardButton(
+                                text="⚪️ Закрыть",
+                                callback_data=f"status_close:{ticket.id}",
+                            ),
+                        ]]
+                    )
                     status_msg = await bot.send_message(
                         chat_id=tech.group_chat_id,
                         message_thread_id=tech_thread_id,
                         text="🎛 <b>Управление статусом:</b>",
-                        reply_markup=_get_status_control_keyboard(ticket.id),
+                        reply_markup=status_kb,
                         parse_mode="HTML",
                     )
-                    await _pin_message_in_topic(
-                        bot,
-                        tech.group_chat_id,
-                        tech_thread_id,
-                        status_msg.message_id,
-                    )
+                    try:
+                        await bot.pin_chat_message(
+                            chat_id=tech.group_chat_id,
+                            message_id=status_msg.message_id,
+                            disable_notification=True,
+                        )
+                        logger.info("📌 Кнопки статусов закреплены")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Не удалось закрепить кнопки статусов: {e}")
                 except Exception as e:
-                    logger.error(f"❌ Ошибка отправки кнопок статуса в тех-топик: {e}")
+                    logger.error(f"❌ Ошибка отправки кнопок статусов: {e}")
 
             # 3) Обновляем назначенного техника у тикета
             ticket.assigned_tech_id = tech.id
@@ -1145,7 +1165,7 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
     try:
         await call.message.answer(
             f"✅ <b>Техник {tech.name} назначен</b>\n\n"
-            f"📁 Топик: #{tech_thread_id}\n"
+            f"🔖 Топик: #{tech_thread_id}\n"
             f"🏷 Тег: [{tag}]",
             parse_mode="HTML",
         )

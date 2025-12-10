@@ -152,37 +152,9 @@ async def _update_all_topic_titles(
     logger.debug(f"📝 Проверка главного топика: '{main_title}'")
 
     # -----------------------------------------------------
-    # 3. Получаем запись TechThread для главного топика
+    # 3. Обновляем главный топик (он хранится в самом Ticket)
     # -----------------------------------------------------
-    stmt = (
-        select(TechThread)
-        .where(
-            TechThread.ticket_id == ticket.id,
-            TechThread.is_main == True
-        )
-        .limit(1)
-    )
-    result = await db.execute(stmt)
-    main_thread = result.scalar_one_or_none()
-
-    # Если записи нет — создаём (редкий случай)
-    if not main_thread:
-        main_thread = TechThread(
-            ticket_id=ticket.id,
-            tech_id=None,
-            tech_chat_id=ticket.main_chat_id,
-            tech_thread_id=ticket.main_thread_id,
-            tech_thread_name=main_title,
-            is_main=True
-        )
-        db.add(main_thread)
-        await db.commit()
-        await db.refresh(main_thread)
-
-    # -----------------------------------------------------
-    # 4. Обновляем главный топик, если название отличается
-    # -----------------------------------------------------
-    if main_thread.tech_thread_name != main_title:
+    if ticket.main_chat_id and ticket.main_thread_id:
         try:
             await bot.edit_forum_topic(
                 chat_id=ticket.main_chat_id,
@@ -191,20 +163,21 @@ async def _update_all_topic_titles(
             )
             logger.info(f"✅ Обновлено название главного топика → {main_title}")
         except TelegramBadRequest as e:
-            # Даже если TOPIC_NOT_MODIFIED — название в БД обновляем.
-            logger.warning(f"⚠️ Ошибка изменения главного топика: {e}")
-
-        # Обновляем в БД
-        main_thread.tech_thread_name = main_title
-        await db.flush()
-
+            if "TOPIC_NOT_MODIFIED" not in str(e):
+                logger.warning(f"⚠️ Ошибка изменения главного топика: {e}")
+            else:
+                logger.debug("ℹ️ Главное название уже корректное — обновление не требуется.")
     else:
-        logger.debug("ℹ️ Главное название уже корректное — обновление не требуется.")
+        logger.warning(f"⚠️ У тикета {ticket.id} нет main_chat_id или main_thread_id")
 
     # -----------------------------------------------------
-    # 5. Обновляем ВСЕ тех-топики
+    # 4. Обновляем ВСЕ тех-топики
     # -----------------------------------------------------
     tech_threads = await get_all_tech_threads_for_ticket(session=db, ticket_id=ticket.id)
+
+    if not tech_threads:
+        logger.debug(f"ℹ️ У тикета {ticket.id} нет тех-топиков")
+        return
 
     # Имя топика у техника всегда assigned=True (без [-] в начале)
     tech_title = _build_topic_title(
@@ -214,16 +187,22 @@ async def _update_all_topic_titles(
     )
 
     for thread in tech_threads:
-        if thread.is_main:
-            continue  # главный уже обработан
-
         logger.debug(
             f"🛠 Проверка тех-топика {thread.tech_chat_id}/{thread.tech_thread_id} "
             f"→ '{tech_title}'"
         )
 
-        # Нужно обновлять если в БД название НЕ совпадает
-        if thread.tech_thread_name != tech_title:
+        # Проверяем, нужно ли обновлять название
+        needs_update = False
+        
+        # Если в модели есть поле tech_thread_name
+        if hasattr(thread, 'tech_thread_name'):
+            needs_update = thread.tech_thread_name != tech_title
+        else:
+            # Если нет поля - всегда пытаемся обновить
+            needs_update = True
+
+        if needs_update:
             try:
                 await bot.edit_forum_topic(
                     chat_id=thread.tech_chat_id,
@@ -233,13 +212,17 @@ async def _update_all_topic_titles(
                 logger.info(
                     f"✅ Обновлено название тех-топика {thread.tech_id} → '{tech_title}'"
                 )
+                
+                # Обновляем в БД, если поле существует
+                if hasattr(thread, 'tech_thread_name'):
+                    thread.tech_thread_name = tech_title
+                    await db.flush()
+                    
             except TelegramBadRequest as e:
-                logger.warning(f"⚠️ Ошибка изменения тех-топика: {e}")
-
-            # Обновляем в БД
-            thread.tech_thread_name = tech_title
-            await db.flush()
-
+                if "TOPIC_NOT_MODIFIED" not in str(e):
+                    logger.warning(f"⚠️ Ошибка изменения тех-топика: {e}")
+                else:
+                    logger.debug(f"ℹ️ Топик техника #{thread.tech_id} уже имеет корректное название")
         else:
             logger.debug(
                 f"ℹ️ Топик техника #{thread.tech_id} уже имеет корректное название"

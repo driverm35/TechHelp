@@ -1,7 +1,8 @@
-# app/workers/mirror_worker.py
 """
-Воркер для обработки очереди сообщений из Redis Streams.
+Mirror Worker — обработчик очереди Redis Streams.
+5 параллельных воркеров, backoff, retry, DLQ, anti-429 throttle.
 """
+
 import asyncio
 import json
 import logging
@@ -18,8 +19,11 @@ from app.utils.redis_streams import redis_streams, STREAM_KEY, GROUP, MAX_RETRIE
 
 logger = logging.getLogger(__name__)
 
-CONSUMER = "mirror_worker_1"
-
+# =============================
+# НАСТРОЙКИ ПРОИЗВОДИТЕЛЬНОСТИ
+# =============================
+WORKER_COUNT = 5
+RATE_LIMIT_DELAY = 0.05   # 50 ms между отправками чтобы избегать 429
 BACKOFF_BASE = 1.8
 BACKOFF_START = 1.0
 
@@ -28,7 +32,19 @@ BACKOFF_START = 1.0
 # UNIVERSAL TELEGRAM SENDER
 # ==================================================================
 async def send_payload(bot: Bot, payload: Dict[str, Any]):
-    """Универсальная отправка сообщения любого типа."""
+    """
+    Универсальная отправка сообщения любого типа из очереди.
+    payload: {
+        "type": text/photo/video/document/voice
+        "text": "...",
+        "file_id": "...",
+        "caption": "...",
+        "target_chat_id": int,
+        "target_thread_id": int | None,
+        "pin": bool,
+        ...
+    }
+    """
     msg_type = payload["type"]
     chat_id = payload["target_chat_id"]
     thread_id = payload.get("target_thread_id")
@@ -49,6 +65,7 @@ async def send_payload(bot: Bot, payload: Dict[str, Any]):
                 disable_web_page_preview=True,
                 **kwargs
             )
+
         elif msg_type == "photo":
             sent = await bot.send_photo(
                 chat_id=chat_id,
@@ -57,6 +74,7 @@ async def send_payload(bot: Bot, payload: Dict[str, Any]):
                 parse_mode="HTML",
                 **kwargs
             )
+
         elif msg_type == "video":
             sent = await bot.send_video(
                 chat_id=chat_id,
@@ -65,6 +83,7 @@ async def send_payload(bot: Bot, payload: Dict[str, Any]):
                 parse_mode="HTML",
                 **kwargs
             )
+
         elif msg_type == "document":
             sent = await bot.send_document(
                 chat_id=chat_id,
@@ -73,6 +92,7 @@ async def send_payload(bot: Bot, payload: Dict[str, Any]):
                 parse_mode="HTML",
                 **kwargs
             )
+
         elif msg_type == "voice":
             sent = await bot.send_voice(
                 chat_id=chat_id,
@@ -82,10 +102,9 @@ async def send_payload(bot: Bot, payload: Dict[str, Any]):
                 **kwargs
             )
         else:
-            raise ValueError(f"Неизвестный msg_type: {msg_type}")
+            raise ValueError(f"Неизвестный тип сообщения: {msg_type}")
 
-        # PIN
-        if sent and pin:
+        if pin and sent:
             try:
                 await bot.pin_chat_message(
                     chat_id=chat_id,
@@ -98,17 +117,21 @@ async def send_payload(bot: Bot, payload: Dict[str, Any]):
         return True
 
     except TelegramRetryAfter as e:
-        logger.warning(f"⏰ 429 RETRY AFTER {e.retry_after}s")
+        # Потоковая блокировка Telegram API
+        logger.warning(f"⏳ 429 Retry-After: {e.retry_after}s")
         await asyncio.sleep(e.retry_after)
         return False
+
     except TelegramBadRequest as e:
-        logger.error(f"❌ BadRequest → {e}")
+        logger.error(f"❌ BadRequest: {e}")
         return "fatal"
+
     except TelegramAPIError as e:
-        logger.error(f"⚠️ Telegram API error: {e}")
+        logger.error(f"⚠️ API Error: {e}")
         return False
+
     except Exception as e:
-        logger.error(f"❌ send_payload error: {e}", exc_info=True)
+        logger.error(f"❌ Ошибка send_payload: {e}", exc_info=True)
         return False
 
 
@@ -116,104 +139,123 @@ async def send_payload(bot: Bot, payload: Dict[str, Any]):
 # PROCESS ONE MESSAGE
 # ==================================================================
 async def process_message(message_id: str, payload: Dict[str, Any]):
-    """Обработка одного сообщения из очереди."""
     bot = Bot(token=payload["bot_token"])
 
     try:
-        result = await send_payload(bot, payload)
+        ok = await send_payload(bot, payload)
 
-        if result is True:
-            logger.info(f"✅ Отправлено: {payload['type']} → {payload['target_chat_id']}")
+        # Успех → ACK
+        if ok is True:
+            logger.info(
+                f"✅ Отправлено: {payload['type']} → chat={payload['target_chat_id']} "
+            )
             return True
 
-        if result == "fatal":
-            await redis_streams.send_to_dlq(payload, "fatal_send_error")
-            logger.info(f"💀 В DLQ: fatal_send_error")
+        # Фатальная ошибка → DLQ
+        if ok == "fatal":
+            await redis_streams.send_to_dlq(payload, "fatal_error")
             return True
 
+        # Нефатальная ошибка → retry
         attempt = payload.get("attempt", 0)
+
         if attempt >= MAX_RETRIES:
             await redis_streams.send_to_dlq(payload, "max_retries_reached")
-            logger.info(f"💀 В DLQ: max_retries (attempts={attempt})")
+            logger.error(f"💀 DLQ: {payload}")
             return True
 
         delay = BACKOFF_START * (BACKOFF_BASE ** attempt)
-        logger.info(f"🔁 RETRY attempt={attempt+1}/{MAX_RETRIES}, delay={delay:.2f}s")
-        await asyncio.sleep(delay)
+        logger.info(
+            f"🔁 RETRY {attempt+1}/{MAX_RETRIES}, delay={delay:.2f}s"
+        )
 
+        await asyncio.sleep(delay)
         payload["attempt"] = attempt + 1
         await redis_streams.enqueue(payload)
+
         return True
 
     except Exception as e:
-        logger.error(f"❌ process_message error: {e}", exc_info=True)
+        logger.error(f"❌ Ошибка process_message: {e}", exc_info=True)
         return False
+
     finally:
         await bot.session.close()
 
 
 # ==================================================================
-# WORKER LOOP
+# WORKER TASK — ОДИН ВОРКЕР
 # ==================================================================
-async def worker_loop():
-    """Основной цикл воркера."""
+async def worker_task(worker_name: str):
+    logger.info(f"🚀 Worker {worker_name} стартует...")
+
     await redis_streams.connect()
     await redis_streams.init()
-
-    logger.info("🚀 Mirror Worker запущен")
-    logger.info(f"📡 Stream: {STREAM_KEY}, Group: {GROUP}, Consumer: {CONSUMER}")
 
     while True:
         try:
             resp = await redis_streams.redis.xreadgroup(
                 groupname=GROUP,
-                consumername=CONSUMER,
+                consumername=worker_name,
                 streams={STREAM_KEY: ">"},
                 count=20,
-                block=3000
+                block=2000
             )
 
             if not resp:
                 continue
 
-            for stream_data in resp:
-                messages = stream_data[1]
-                
-                for msg_id, fields in messages:
+            for _, messages in resp:
+                for msg_id, raw in messages:
+
                     try:
-                        payload = json.loads(fields["payload"])
-                    except Exception as e:
-                        logger.error(f"❌ Некорректный payload: {e}")
+                        payload = json.loads(raw["payload"])
+                    except Exception:
+                        logger.error("❌ Некорректный payload, ACK")
                         await redis_streams.ack(msg_id)
                         continue
 
                     ok = await process_message(msg_id, payload)
+
                     if ok:
                         await redis_streams.ack(msg_id)
 
+                    # Anti-429
+                    await asyncio.sleep(RATE_LIMIT_DELAY)
+
         except Exception as e:
-            logger.error(f"❌ WorkerLoop ERROR: {e}", exc_info=True)
+            logger.error(f"❌ Worker {worker_name} ERROR: {e}", exc_info=True)
             await asyncio.sleep(2)
 
 
 # ==================================================================
-# ENTRYPOINT для standalone запуска
+# MAIN WORKER LOOP (RUN 5 WORKERS)
+# ==================================================================
+async def worker_loop():
+    logger.info(f"🔥 Запускаем {WORKER_COUNT} воркеров Redis Streams...")
+
+    tasks = []
+
+    for i in range(WORKER_COUNT):
+        name = f"mirror_worker_{i+1}"
+        tasks.append(asyncio.create_task(worker_task(name)))
+
+    # Ждём завершения всех (обычно никогда)
+    await asyncio.gather(*tasks)
+
+
+# ==================================================================
+# ENTRYPOINT
 # ==================================================================
 async def mirror_worker():
-    """
-    Точка входа для воркера.
-    Может быть запущена как отдельный процесс или как задача в main event loop.
-    """
     try:
         await worker_loop()
     except asyncio.CancelledError:
-        logger.info("⏹️ Mirror worker остановлен")
+        logger.info("⛔ Worker остановлен")
     except Exception as e:
-        logger.error(f"❌ Mirror worker crashed: {e}", exc_info=True)
-        raise
+        logger.error(f"❌ Worker crash: {e}", exc_info=True)
     finally:
         await redis_streams.disconnect()
-        logger.info("✅ Redis Streams отключен")
 
 
 if __name__ == "__main__":

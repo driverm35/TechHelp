@@ -1,223 +1,116 @@
-import asyncio
+# app/utils/redis_streams.py
 import json
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
-import aioredis
-from aiogram import Bot
-from aiogram.exceptions import (
-    TelegramRetryAfter,
-    TelegramBadRequest,
-    TelegramAPIError,
-)
-
-from app.utils.redis_streams import redis_streams, STREAM_KEY, GROUP, MAX_RETRIES
+from redis.asyncio import Redis
 
 logger = logging.getLogger(__name__)
 
-CONSUMER = "mirror_worker_1"
-
-BACKOFF_BASE = 1.8       # коэффициент экспоненциальной задержки
-BACKOFF_START = 1.0      # стартовая задержка в секундах
+# ==================================================================
+# КОНФИГУРАЦИЯ
+# ==================================================================
+STREAM_KEY = "supportbot:mirror"
+DLQ_KEY = "supportbot:dlq"
+GROUP = "mirror_group"
+MAX_RETRIES = 5
 
 
 # ==================================================================
-# UNIVERSAL TELEGRAM SENDER — отправляет ВСЕ типы сообщений
+# REDIS STREAMS MANAGER
 # ==================================================================
-async def send_payload(bot: Bot, payload: Dict[str, Any]):
-    """
-    Универсальная отправка сообщения любого типа.
-    Поддерживает:
-    text / photo / video / document / voice
-    """
+class RedisStreamsManager:
+    def __init__(self, redis_url: str = "redis://redis:6379/0"):
+        self.redis_url = redis_url
+        self.redis: Optional[Redis] = None
 
-    msg_type = payload["type"]
-    chat_id = payload["target_chat_id"]
-    thread_id = payload.get("target_thread_id")
-    pin = payload.get("pin", False)
-
-    kwargs = {}
-    if thread_id:
-        kwargs["message_thread_id"] = thread_id
-
-    sent = None
-
-    try:
-        # TEXT
-        if msg_type == "text":
-            sent = await bot.send_message(
-                chat_id=chat_id,
-                text=payload["text"],
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-                **kwargs
+    async def connect(self):
+        """Подключение к Redis"""
+        if self.redis is None:
+            self.redis = await Redis.from_url(
+                self.redis_url,
+                encoding="utf-8",
+                decode_responses=True
             )
+            logger.info("✅ Redis connected")
 
-        # PHOTO
-        elif msg_type == "photo":
-            sent = await bot.send_photo(
-                chat_id=chat_id,
-                photo=payload["file_id"],
-                caption=payload.get("caption"),
-                parse_mode="HTML",
-                **kwargs
-            )
+    async def disconnect(self):
+        """Отключение от Redis"""
+        if self.redis:
+            await self.redis.close()
+            self.redis = None
+            logger.info("❌ Redis disconnected")
 
-        # VIDEO
-        elif msg_type == "video":
-            sent = await bot.send_video(
-                chat_id=chat_id,
-                video=payload["file_id"],
-                caption=payload.get("caption"),
-                parse_mode="HTML",
-                **kwargs
-            )
-
-        # DOCUMENT
-        elif msg_type == "document":
-            sent = await bot.send_document(
-                chat_id=chat_id,
-                document=payload["file_id"],
-                caption=payload.get("caption"),
-                parse_mode="HTML",
-                **kwargs
-            )
-
-        # VOICE
-        elif msg_type == "voice":
-            sent = await bot.send_voice(
-                chat_id=chat_id,
-                voice=payload["file_id"],
-                caption=payload.get("caption"),
-                parse_mode="HTML",
-                **kwargs
-            )
-
-        # UNKNOWN TYPE
-        else:
-            raise ValueError(f"Неизвестный msg_type: {msg_type}")
-
-        # PIN
-        if sent and pin:
-            try:
-                await bot.pin_chat_message(
-                    chat_id=chat_id,
-                    message_id=sent.message_id,
-                    disable_notification=True
-                )
-            except Exception as e:
-                logger.warning(f"PIN ошибка: {e}")
-
-        return True
-
-    # Telegram просит подождать (rate limit)
-    except TelegramRetryAfter as e:
-        logger.warning(f"429 RETRY AFTER {e.retry_after}s")
-        await asyncio.sleep(e.retry_after)
-        return False
-
-    except TelegramBadRequest as e:
-        # ошибка отправки — не retryable
-        logger.error(f"BadRequest → {e}")
-        return "fatal"
-
-    except TelegramAPIError as e:
-        logger.error(f"Telegram API error: {e}")
-        return False
-
-    except Exception as e:
-        logger.error(f"send_payload error: {e}")
-        return False
-
-
-# ==================================================================
-# PROCESS ONE MESSAGE
-# ==================================================================
-async def process_message(message_id: str, payload: Dict[str, Any]):
-    bot = Bot(token=payload["bot_token"])
-
-    result = await send_payload(bot, payload)
-
-    # Успех → ACK
-    if result is True:
-        return True
-
-    # Фатальная ошибка → DLQ
-    if result == "fatal":
-        await redis_streams.send_to_dlq(payload, "fatal_send_error")
-        return True
-
-    # RETRY
-    attempt = payload.get("attempt", 0)
-
-    if attempt >= MAX_RETRIES:
-        await redis_streams.send_to_dlq(payload, "max_retries_reached")
-        return True
-
-    # Экспоненциальная задержка
-    delay = BACKOFF_START * (BACKOFF_BASE ** attempt)
-    logger.info(f"🔁 RETRY attempt={attempt+1}, delay={delay:.2f}s")
-
-    await asyncio.sleep(delay)
-
-    payload["attempt"] = attempt + 1
-    await redis_streams.enqueue(payload)
-
-    return True
-
-
-# ==================================================================
-# MAIN WORKER LOOP
-# ==================================================================
-async def worker_loop():
-    redis = redis_streams.redis
-
-    logger.info("🚀 Mirror Worker запущен")
-
-    # создаём группу, если нет
-    await redis_streams.init()
-
-    while True:
+    async def init(self):
+        """Инициализация: создание consumer group"""
         try:
-            # читаем pending + новые сообщения
-            resp = await redis.xreadgroup(
+            await self.redis.xgroup_create(
+                name=STREAM_KEY,
                 groupname=GROUP,
-                consumername=CONSUMER,
-                streams={STREAM_KEY: ">"},
-                count=20,
-                block=3000  # 3 секунды
+                id="0",
+                mkstream=True
             )
-
-            if not resp:
-                continue
-
-            for stream, messages in resp:
-                for msg_id, fields in messages:
-
-                    try:
-                        payload = json.loads(fields["payload"])
-                    except Exception as e:
-                        logger.error(f"Некорректный payload: {fields}")
-                        await redis_streams.ack(msg_id)
-                        continue
-
-                    ok = await process_message(msg_id, payload)
-
-                    if ok:
-                        await redis_streams.ack(msg_id)
-
+            logger.info(f"✅ Consumer group '{GROUP}' создана")
         except Exception as e:
-            logger.error(f"WorkerLoop ERROR: {e}", exc_info=True)
-            await asyncio.sleep(2)
+            if "BUSYGROUP" in str(e):
+                logger.debug(f"Consumer group '{GROUP}' уже существует")
+            else:
+                logger.error(f"Ошибка создания группы: {e}")
+
+    async def enqueue(self, payload: Dict[str, Any]):
+        """
+        Добавить сообщение в очередь.
+        
+        Args:
+            payload: Словарь с данными для отправки
+                     ОБЯЗАТЕЛЬНО: bot_token, type, target_chat_id
+                     ОПЦИОНАЛЬНО: target_thread_id, text, file_id, caption, pin
+        """
+        if not self.redis:
+            await self.connect()
+
+        payload_json = json.dumps(payload, ensure_ascii=False)
+
+        msg_id = await self.redis.xadd(
+            name=STREAM_KEY,
+            fields={"payload": payload_json}
+        )
+
+        logger.debug(f"➕ Enqueued: {msg_id} → {payload.get('type')} to {payload.get('target_chat_id')}")
+        return msg_id
+
+    async def ack(self, message_id: str):
+        """Подтвердить обработку сообщения"""
+        await self.redis.xack(STREAM_KEY, GROUP, message_id)
+        logger.debug(f"✅ ACK: {message_id}")
+
+    async def send_to_dlq(self, payload: Dict[str, Any], reason: str):
+        """Отправить в Dead Letter Queue"""
+        dlq_data = {
+            "payload": json.dumps(payload, ensure_ascii=False),
+            "reason": reason
+        }
+        await self.redis.xadd(DLQ_KEY, fields=dlq_data)
+        logger.warning(f"💀 DLQ: {reason} → {payload.get('ticket_id', 'N/A')}")
+
+    async def health(self) -> Dict[str, Any]:
+        """Статистика для health-check"""
+        try:
+            pending = await self.redis.xpending(STREAM_KEY, GROUP)
+            stream_len = await self.redis.xlen(STREAM_KEY)
+            dlq_len = await self.redis.xlen(DLQ_KEY)
+
+            return {
+                "stream_length": stream_len,
+                "pending_messages": pending["pending"] if pending else 0,
+                "dlq_length": dlq_len,
+            }
+        except Exception as e:
+            logger.error(f"Health check error: {e}")
+            return {"error": str(e)}
 
 
 # ==================================================================
-# ENTRYPOINT
+# SINGLETON INSTANCE
 # ==================================================================
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-    )
-
-    asyncio.run(worker_loop())
+redis_streams = RedisStreamsManager()

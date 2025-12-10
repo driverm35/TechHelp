@@ -107,6 +107,7 @@ async def main():
         ("APP_ENV", settings.app_env),
         ("Режим БД", settings.db_dsn),
         ("Режим работы", "polling" if (settings.use_polling or settings.is_dev) else "webhook"),
+        ("Вебхук URL", settings.webhook_url if settings.webhook_url else "не установлен"),
         ("ADMIN IDS", settings.get_admin_ids())
     ])
 

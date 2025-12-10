@@ -1293,7 +1293,7 @@ async def callback_change_status(call: CallbackQuery, bot: Bot) -> None:
                     pass
 
                 # Тех-топики
-                tech_threads = await get_all_tech_threads_for_ticket(db, ticket.id)
+                tech_threads = await get_all_tech_threads_for_ticket(session=db, ticket_id=ticket.id)
                 for th in tech_threads:
                     try:
                         await bot.reopen_forum_topic(
@@ -1322,7 +1322,7 @@ async def callback_change_status(call: CallbackQuery, bot: Bot) -> None:
                     pass
 
                 # Закрываем тех-топики
-                tech_threads = await get_all_tech_threads_for_ticket(db, ticket.id)
+                tech_threads = await get_all_tech_threads_for_ticket(session=db, ticket_id=ticket.id)
                 for th in tech_threads:
                     try:
                         await bot.close_forum_topic(

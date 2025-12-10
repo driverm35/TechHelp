@@ -1,7 +1,7 @@
 services:
   bot:
     build: .
-    container_name: supportbot
+    container_name: bot
     env_file: [.env]
     restart: unless-stopped
     depends_on:
@@ -14,7 +14,7 @@ services:
 
   worker:
     build: .
-    container_name: supportbot-worker
+    container_name: bot-worker
     env_file: [.env]
     command: python -m app.workers.mirror_worker
     restart: unless-stopped
@@ -26,7 +26,7 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: supportbot-redis
+    container_name: bot-redis
     command: ["redis-server", "--appendonly", "yes", "--save", "60", "1000"]
     restart: unless-stopped
     networks: [appnet]

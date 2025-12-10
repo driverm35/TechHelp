@@ -5,6 +5,7 @@ services:
     env_file: [.env]
     restart: unless-stopped
     depends_on:
+      - postgres
       - redis
     volumes:
       - ./data:/app/data
@@ -20,9 +21,24 @@ services:
     restart: unless-stopped
     depends_on:
       - redis
+      - postgres
     networks: [appnet]
     volumes:
       - ./logs:/app/logs
+
+  postgres:
+    image: postgres:15
+    container_name: supportbot-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    restart: unless-stopped
+    networks: [appnet]
 
   redis:
     image: redis:7-alpine
@@ -45,7 +61,27 @@ services:
       - caddy_config:/config
     networks: [appnet]
 
+  backup:
+    build:
+      context: .
+      dockerfile: Dockerfile.backup
+    container_name: supportbot-backup
+    restart: unless-stopped
+    env_file: [.env]
+    volumes:
+      - ./backup_logs:/var/log
+      - ./app/backup:/backup:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "30m"
+        max-file: "5"
+    depends_on:
+      - postgres
+    networks: [appnet]
+
 volumes:
+  pgdata:
   caddy_data:
   caddy_config:
 

@@ -1505,7 +1505,7 @@ async def callback_change_status(call: CallbackQuery, bot: Bot) -> None:
                 TicketStatus.WORK: "🟡",
                 TicketStatus.CLOSED: "⚪️",
             }[new_status]
-
+            await call.answer(f"{emoji} Статус изменён", show_alert=True)
         except Exception as e:
             logger.error(f"❌ Ошибка callback_change_status:", exc_info=True)
             await db.rollback()

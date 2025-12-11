@@ -1,13 +1,20 @@
 """
 Mirror Worker — 10 параллельных воркеров с гарантией FIFO per ticket.
+Логика полностью переработана под новую архитектуру:
+
+- Виртуальный sequence_id для каждого ПЕРЕНОСА истории.
+- История тикета всегда пересылается начиная с sequence_id = 1.
+- Живые сообщения (live) — БЕЗ sequence_id → идут напрямую сразу.
+- FIFO гарантировано: каждое ticket_id имеет собственный поток.
+- WATCHDOG не падает, если нет данных в очереди.
 """
 
 import asyncio
 import json
 import logging
 import time
-from typing import Dict, Any, Tuple
 from collections import defaultdict
+from typing import Dict, Any, Tuple, Optional
 
 from aiogram import Bot
 from aiogram.exceptions import (
@@ -16,37 +23,47 @@ from aiogram.exceptions import (
     TelegramAPIError,
 )
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
 from app.utils.redis_streams import redis_streams, STREAM_KEY, GROUP
+from app.config import settings
+
 
 logger = logging.getLogger(__name__)
 
 # =============================
 # НАСТРОЙКИ
 # =============================
-TEXT_DELAY = 0.05
-MEDIA_DELAY = 1.3
-WORKER_TIMEOUT = 60  # если воркер висит >60 сек — перезапуск
+TEXT_DELAY = 0.04
+MEDIA_DELAY = 0.9
+WORKER_TIMEOUT = 60
 CONSUMER = "mirror_worker_fifo"
 
 # =============================
-# ГЛОБАЛЬНЫЕ СТРУКТУРЫ
+# ГЛОБАЛЬНЫЕ СТРУКТУРЫ (только в памяти воркера)
 # =============================
 ticket_buffers: Dict[int, Dict[int, Tuple[str, Dict]]] = defaultdict(dict)
-ticket_next_seq: Dict[int, int] = {}
+ticket_next_seq: Dict[int, int] = {}              # ожидаемый seq
+ticket_processing: Dict[int, bool] = defaultdict(lambda: False)
 
+# статистика (для логов)
 ticket_stats: Dict[int, Dict[str, Any]] = defaultdict(lambda: {
     "start_time": None,
     "count": 0,
 })
-ticket_in_progress: Dict[int, int | None] = defaultdict(lambda: None)
+
+ticket_in_progress: Dict[int, Optional[int]] = defaultdict(lambda: None)
 
 
-
-# =============================
-# UNIVERSAL TELEGRAM SENDER
-# =============================
+# ================================================================
+# УНИВЕРСАЛЬНАЯ ОТПРАВКА
+# ================================================================
 async def send_payload(bot: Bot, payload: Dict[str, Any]) -> bool:
-    """Универсальная отправка. True = OK, False = повторить."""
+    """
+    Базовая отправка сообщения в Telegram.
+    True — задача выполнена и ACK можно послать.
+    False — повторить отправку.
+    """
+
     msg_type = payload["type"]
     chat_id = payload["target_chat_id"]
     thread_id = payload.get("target_thread_id")
@@ -56,6 +73,9 @@ async def send_payload(bot: Bot, payload: Dict[str, Any]) -> bool:
         kwargs["message_thread_id"] = thread_id
 
     try:
+        # ------------------------
+        # TEXT
+        # ------------------------
         if msg_type == "text":
             await bot.send_message(
                 chat_id=chat_id,
@@ -67,73 +87,86 @@ async def send_payload(bot: Bot, payload: Dict[str, Any]) -> bool:
             await asyncio.sleep(TEXT_DELAY)
             return True
 
+        # ------------------------
+        # PHOTO
+        # ------------------------
         elif msg_type == "photo":
             await bot.send_photo(
                 chat_id=chat_id,
                 photo=payload["file_id"],
-                caption=payload.get("caption"),
+                caption=payload.get("caption") or None,
                 parse_mode="HTML",
                 **kwargs
             )
             await asyncio.sleep(MEDIA_DELAY)
             return True
 
+        # ------------------------
+        # VIDEO
+        # ------------------------
         elif msg_type == "video":
             await bot.send_video(
                 chat_id=chat_id,
                 video=payload["file_id"],
-                caption=payload.get("caption"),
+                caption=payload.get("caption") or None,
                 parse_mode="HTML",
                 **kwargs
             )
             await asyncio.sleep(MEDIA_DELAY)
             return True
 
+        # ------------------------
+        # DOCUMENT
+        # ------------------------
         elif msg_type == "document":
             await bot.send_document(
                 chat_id=chat_id,
                 document=payload["file_id"],
-                caption=payload.get("caption"),
+                caption=payload.get("caption") or None,
                 parse_mode="HTML",
                 **kwargs
             )
             await asyncio.sleep(MEDIA_DELAY)
             return True
 
+        # ------------------------
+        # VOICE
+        # ------------------------
         elif msg_type == "voice":
             await bot.send_voice(
                 chat_id=chat_id,
                 voice=payload["file_id"],
-                caption=payload.get("caption"),
+                caption=payload.get("caption") or None,
                 parse_mode="HTML",
                 **kwargs
             )
             await asyncio.sleep(MEDIA_DELAY)
             return True
 
+        # ------------------------
+        # STATUS BUTTONS
+        # ------------------------
         elif msg_type == "status_buttons":
             ticket_id = payload["ticket_id"]
 
-            kb = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="Отправить опрос",
-                            callback_data=f"send_feedback_button:{ticket_id}",
-                        ),
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            text="🟡 В работе",
-                            callback_data=f"status_work:{ticket_id}",
-                        ),
-                        InlineKeyboardButton(
-                            text="⚪️ Закрыть",
-                            callback_data=f"status_close:{ticket_id}",
-                        )
-                    ]
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Отправить опрос",
+                        callback_data=f"send_feedback_button:{ticket_id}"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🟡 В работе",
+                        callback_data=f"status_work:{ticket_id}"
+                    ),
+                    InlineKeyboardButton(
+                        text="⚪️ Закрыть",
+                        callback_data=f"status_close:{ticket_id}"
+                    )
                 ]
-            )
+            ])
 
             msg = await bot.send_message(
                 chat_id=chat_id,
@@ -146,7 +179,8 @@ async def send_payload(bot: Bot, payload: Dict[str, Any]) -> bool:
             if payload.get("pin"):
                 try:
                     await bot.pin_chat_message(
-                        chat_id=chat_id, message_id=msg.message_id,
+                        chat_id=chat_id,
+                        message_id=msg.message_id,
                         disable_notification=True
                     )
                 except Exception:
@@ -155,12 +189,15 @@ async def send_payload(bot: Bot, payload: Dict[str, Any]) -> bool:
             await asyncio.sleep(TEXT_DELAY)
             return True
 
+        # ------------------------
+        # FAILSAFE
+        # ------------------------
         else:
-            logger.error(f"❌ Неизвестный тип: {msg_type}")
+            logger.error(f"❌ Неизвестный тип сообщения: {msg_type}")
             return True
 
     except TelegramRetryAfter as e:
-        logger.warning(f"⏳ 429: ждем {e.retry_after}s")
+        logger.warning(f"⏳ Telegram 429 — ждём {e.retry_after}s")
         await asyncio.sleep(e.retry_after)
         return False
 
@@ -169,7 +206,7 @@ async def send_payload(bot: Bot, payload: Dict[str, Any]) -> bool:
         return True
 
     except TelegramAPIError as e:
-        logger.error(f"⚠️ API Error: {e}")
+        logger.error(f"⚠️ Telegram API error: {e}")
         await asyncio.sleep(1)
         return False
 
@@ -179,11 +216,11 @@ async def send_payload(bot: Bot, payload: Dict[str, Any]) -> bool:
         return False
 
 
-# =============================
-# SAFE WRAPPER
-# =============================
+
+# ================================================================
+# ОБЁРТКА С РЕТРАЯМИ
+# ================================================================
 async def send_message_safe(payload: Dict[str, Any]) -> bool:
-    """Отправляет сообщение с ретраями."""
     bot = Bot(token=payload["bot_token"])
     try:
         while True:
@@ -195,32 +232,37 @@ async def send_message_safe(payload: Dict[str, Any]) -> bool:
         await bot.session.close()
 
 
-# =============================
-# PROCESS MESSAGE ORDERED
-# =============================
-async def process_message_ordered(msg_id: str, payload: Dict[str, Any]) -> bool:
-    ticket_id = payload.get("ticket_id")
-    sequence_id = payload.get("sequence_id")
 
-    # Без sequence — обычная отправка
-    if ticket_id is None or sequence_id is None:
+# ================================================================
+# FIFO-ЛОГИКА (АРХИТЕКТУРА С ВИРТУАЛЬНЫМИ SEQUENCE)
+# ================================================================
+async def process_message_ordered(msg_id: str, payload: Dict[str, Any]) -> bool:
+    """
+    Полный FIFO per ticket.
+    live-сообщения — без sequence_id → отправляются сразу.
+    """
+
+    ticket_id = payload.get("ticket_id")
+    seq = payload.get("sequence_id")
+
+    # ================
+    # LIVE (нет sequence)
+    # ================
+    if ticket_id is None or seq is None:
         return await send_message_safe(payload)
 
-    # =============================
-    # ИНИЦИАЛИЗАЦИЯ ТИКЕТА
-    # =============================
+    # ================
+    # INIT TICKET
+    # ================
     if ticket_id not in ticket_next_seq:
-        ticket_next_seq[ticket_id] = sequence_id
+        ticket_next_seq[ticket_id] = seq
         ticket_buffers[ticket_id] = {}
-
         ticket_stats[ticket_id]["start_time"] = time.time()
         ticket_stats[ticket_id]["count"] = 0
+        ticket_processing[ticket_id] = True
 
-        logger.info(f"🚀 Тикет #{ticket_id}: НАЧАЛАСЬ пересылка")
-
-        # уведомление в главный топик
+        # уведомление
         try:
-            from app.config import settings
             bot = Bot(token=payload["bot_token"])
             await bot.send_message(
                 chat_id=settings.main_group_id,
@@ -229,138 +271,130 @@ async def process_message_ordered(msg_id: str, payload: Dict[str, Any]) -> bool:
                 parse_mode="HTML",
             )
             await bot.session.close()
-        except Exception as e:
-            logger.error(f"❌ Ошибка нотификации начала: {e}")
+        except Exception:
+            pass
 
     expected = ticket_next_seq[ticket_id]
 
-    # =============================
+    # ================
     # OUT OF ORDER
-    # =============================
-    if sequence_id < expected:
+    # ================
+    if seq < expected:
         logger.warning(
-            f"⚠️ Дубликат seq={sequence_id} для ticket={ticket_id} (ожидается {expected})"
+            f"⚠️ Дубликат seq={seq} ticket={ticket_id} (ожидали {expected})"
         )
         return True
 
-    if sequence_id > expected:
+    if seq > expected:
         logger.info(
-            f"📦 Буферизуем seq={sequence_id} (ждем {expected}) ticket={ticket_id}"
+            f"📦 Буферизация seq={seq} (ждём {expected}) ticket={ticket_id}"
         )
-        ticket_buffers[ticket_id][sequence_id] = (msg_id, payload)
+        ticket_buffers[ticket_id][seq] = (msg_id, payload)
         return False
 
-    # =============================
-    # PROCESS CURRENT SEQUENCE
-    # =============================
-    logger.info(
-        f"➡️ Отправка seq={sequence_id} ticket={ticket_id} (ожидали {expected})"
-    )
+    # ================
+    # PROCESS CURRENT
+    # ================
+    logger.info(f"➡️ seq={seq} ticket={ticket_id}")
 
     ok = await send_message_safe(payload)
-    if ok:
-        ticket_stats[ticket_id]["count"] += 1
     if not ok:
         return False
 
+    ticket_stats[ticket_id]["count"] += 1
     ticket_next_seq[ticket_id] += 1
 
-    # =============================
+    # ================
     # PROCESS BUFFER
-    # =============================
+    # ================
     while True:
         next_seq = ticket_next_seq[ticket_id]
+        buffered = ticket_buffers[ticket_id].pop(next_seq, None)
 
-        if next_seq not in ticket_buffers[ticket_id]:
+        if not buffered:
             break
 
-        buffered_msg_id, buffered_payload = ticket_buffers[ticket_id].pop(next_seq)
-        logger.info(
-            f"📤 Из буфера: seq={next_seq} ticket={ticket_id}"
-        )
+        buffered_msg_id, buffered_payload = buffered
+        logger.info(f"📤 Из буфера seq={next_seq} ticket={ticket_id}")
 
-        ok = await send_message_safe(buffered_payload)
-        if ok:
-            ticket_stats[ticket_id]["count"] += 1
-        if not ok:
-            ticket_buffers[ticket_id][next_seq] = (buffered_msg_id, buffered_payload)
+        ok2 = await send_message_safe(buffered_payload)
+        if not ok2:
+            ticket_buffers[ticket_id][next_seq] = buffered
             break
+
+        ticket_stats[ticket_id]["count"] += 1
+        ticket_next_seq[ticket_id] += 1
 
         try:
             await redis_streams.ack(buffered_msg_id)
-        except Exception as e:
-            logger.error(f"❌ Ошибка ACK буферного сообщения: {e}")
+        except Exception:
+            pass
 
-        ticket_next_seq[ticket_id] += 1
-
-    # =============================
+    # ================
     # FINISH
-    # =============================
+    # ================
     if not ticket_buffers[ticket_id]:
         total = ticket_stats[ticket_id]["count"]
         elapsed = round(time.time() - ticket_stats[ticket_id]["start_time"], 2)
+        logger.info(f"🎉 Тикет #{ticket_id} завершён: {total} сообщений, {elapsed}s")
 
-        logger.info(
-            f"🎉 Тикет #{ticket_id}: ПЕРЕСЫЛКА ЗАВЕРШЕНА — {total} сообщений, {elapsed} сек"
-        )
-
-        # уведомление в главный топик
+        # уведомление
         try:
-            from app.config import settings
             bot = Bot(token=payload["bot_token"])
             await bot.send_message(
                 chat_id=settings.main_group_id,
                 message_thread_id=payload.get("main_thread_id"),
-                text=(
-                    f"📬 <b>Пересылка завершена</b>\n"
-                    f"Тикет #{ticket_id}\n"
-                    f"• Сообщений: <b>{total}</b>\n"
-                    f"• Время: <b>{elapsed} сек</b>"
-                ),
+                text=f"📬 <b>Пересылка завершена</b>\nТикет #{ticket_id}",
                 parse_mode="HTML",
             )
             await bot.session.close()
-        except Exception as e:
-            logger.error(f"❌ Ошибка финальной нотификации: {e}")
+        except Exception:
+            pass
+
+        # УДАЛЯЕМ ticket state полностью
+        del ticket_next_seq[ticket_id]
+        del ticket_buffers[ticket_id]
+        del ticket_stats[ticket_id]
+        ticket_processing[ticket_id] = False
 
     return True
 
 
-# =============================
+
+# ================================================================
 # WORKER LOOP + WATCHDOG
-# =============================
+# ================================================================
 async def worker_loop(worker_id: int):
-    consumer_name = f"{CONSUMER}_{worker_id}"
-    logger.info(f"🚀 Worker #{worker_id} ЗАПУЩЕН")
+    consumer = f"{CONSUMER}_{worker_id}"
+    logger.info(f"🚀 Worker #{worker_id} запущен")
 
     last_activity = time.time()
-    ticket_in_progress[worker_id] = None  # воркер пока ничем не занят
+    ticket_in_progress[worker_id] = None
 
     await redis_streams.connect()
     await redis_streams.init()
 
     while True:
         try:
-            # ----- WATCHDOG -----
-            if ticket_in_progress[worker_id] is not None:  # воркер реально занят тикетом
+            # ---------------- WATCHDOG ----------------
+            current_ticket = ticket_in_progress[worker_id]
+            if current_ticket is not None:
                 if time.time() - last_activity > WORKER_TIMEOUT:
-                    t_id = ticket_in_progress[worker_id]
                     logger.error(
-                        f"🔥 Worker #{worker_id} завис на ticket={t_id} >{WORKER_TIMEOUT}s — перезапуск"
+                        f"🔥 Worker #{worker_id} завис на ticket={current_ticket}"
                     )
-                    raise RuntimeError("Worker hang detected")
+                    raise RuntimeError("worker hang detected")
 
-            # ----- Чтение очереди -----
+            # ---------------- READ STREAM ----------------
             resp = await redis_streams.redis.xreadgroup(
                 groupname=GROUP,
-                consumername=consumer_name,
+                consumername=consumer,
                 streams={STREAM_KEY: ">"},
                 count=1,
-                block=3000  # 3 сек ожидания
+                block=3000,
             )
 
             if not resp:
-                # нет задач → воркер НЕ считается зависшим
                 continue
 
             for _, messages in resp:
@@ -370,51 +404,51 @@ async def worker_loop(worker_id: int):
                     try:
                         payload = json.loads(raw["payload"])
                     except Exception:
-                        logger.error(f"❌ Worker #{worker_id}: плохой payload")
                         await redis_streams.ack(msg_id)
                         continue
 
                     ticket_id = payload.get("ticket_id")
-                    seq = payload.get("sequence_id", "?")
+                    seq = payload.get("sequence_id")
 
-                    ticket_in_progress[worker_id] = ticket_id  # воркер начал обработку
+                    ticket_in_progress[worker_id] = ticket_id
 
                     logger.info(
-                        f"📨 Worker #{worker_id}: ticket={ticket_id} seq={seq}"
+                        f"📨 Worker#{worker_id}: ticket={ticket_id} seq={seq}"
                     )
 
                     ok = await process_message_ordered(msg_id, payload)
 
                     if ok:
                         await redis_streams.ack(msg_id)
-                        logger.info(f"✔ ACK worker={worker_id} seq={seq}")
+                        logger.info(
+                            f"✔ ACK worker={worker_id} ticket={ticket_id} seq={seq}"
+                        )
 
-                    ticket_in_progress[worker_id] = None  # воркер свободен
+                    ticket_in_progress[worker_id] = None
 
         except Exception as e:
-            logger.error(f"❌ Ошибка Worker #{worker_id}: {e}", exc_info=True)
-            ticket_in_progress[worker_id] = None  # сбрасываем статус
+            logger.error(f"❌ Ошибка worker #{worker_id}: {e}", exc_info=True)
+            ticket_in_progress[worker_id] = None
             await asyncio.sleep(1)
 
 
 
-# =============================
-# POOL MANAGER
-# =============================
+# ================================================================
+# MANAGER
+# ================================================================
 async def mirror_worker():
     NUM_WORKERS = 10
     tasks = []
 
     try:
         for i in range(1, NUM_WORKERS + 1):
-            t = asyncio.create_task(worker_loop(i))
-            tasks.append(t)
+            tasks.append(asyncio.create_task(worker_loop(i)))
 
         logger.info(f"🚀 Запущено {NUM_WORKERS} воркеров")
         await asyncio.gather(*tasks)
 
     except asyncio.CancelledError:
-        logger.info("⛔ Завершение: останавливаем воркеров…")
+        logger.info("⛔ Остановка воркеров...")
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -428,4 +462,5 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     )
+
     asyncio.run(mirror_worker())

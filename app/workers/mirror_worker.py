@@ -265,10 +265,9 @@ async def process_message_ordered(msg_id: str, payload: Dict[str, Any]) -> bool:
         try:
             bot = Bot(token=payload["bot_token"])
             await bot.send_message(
-                chat_id=settings.main_group_id,
-                message_thread_id=payload.get("main_thread_id"),
+                chat_id=payload["target_chat_id"],
+                message_thread_id=payload.get("target_thread_id"),
                 text=f"📤 <b>Начата пересылка истории</b>\nТикет #{ticket_id}",
-                parse_mode="HTML",
             )
             await bot.session.close()
         except Exception:
@@ -342,9 +341,14 @@ async def process_message_ordered(msg_id: str, payload: Dict[str, Any]) -> bool:
         try:
             bot = Bot(token=payload["bot_token"])
             await bot.send_message(
-                chat_id=settings.main_group_id,
-                message_thread_id=payload.get("main_thread_id"),
-                text=f"📬 <b>Пересылка завершена</b>\nТикет #{ticket_id}",
+                chat_id=payload["target_chat_id"],
+                message_thread_id=payload.get("target_thread_id"),
+                text=(
+                    f"📬 <b>Пересылка завершена</b>\n"
+                    f"Тикет #{ticket_id}\n"
+                    f"• Сообщений: <b>{total}</b>\n"
+                    f"• Время: <b>{elapsed} сек</b>"
+                ),
                 parse_mode="HTML",
             )
             await bot.session.close()

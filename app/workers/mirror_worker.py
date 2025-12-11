@@ -107,20 +107,24 @@ async def send_payload(bot: Bot, payload: Dict[str, Any]) -> bool:
             ticket_id = payload["ticket_id"]
     
             kb = InlineKeyboardMarkup(
-                inline_keyboard=[[
-                    InlineKeyboardButton(
-                        text="🟡 В работе",
-                        callback_data=f"status_work:{ticket_id}",
-                    ),
-                    InlineKeyboardButton(
-                        text="⚪️ Закрыть",
-                        callback_data=f"status_close:{ticket_id}",
-                    )],[
-                    InlineKeyboardButton(
-                        text="Отправить опрос",
-                        callback_data=f"send_feedback_button:{ticket_id}",
-                    ),
-                ]]
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Отправить опрос",
+                            callback_data=f"send_feedback_button:{ticket_id}",
+                        ),
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="🟡 В работе",
+                            callback_data=f"status_work:{ticket_id}",
+                        ),
+                        InlineKeyboardButton(
+                            text="⚪️ Закрыть",
+                            callback_data=f"status_close:{ticket_id}",
+                        )
+                    ]
+                ]
             )
 
             msg = await bot.send_message(

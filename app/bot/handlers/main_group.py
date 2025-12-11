@@ -1183,24 +1183,35 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
             tech_thread_id = None
 
             if existing_thread:
-                # ========================================
-                # Путь А: Переиспользуем старый топик
-                # ========================================
+                is_same_ticket = existing_thread.ticket_id == ticket.id
+
                 tech_thread_id = existing_thread.tech_thread_id
 
-                # Привязываем к текущему тикету
-                existing_thread.ticket_id = ticket.id
+                # Перепривязываем если необходимо
+                if not is_same_ticket:
+                    logger.info(
+                        f"🔁 Переиспользуем топик #{tech_thread_id}: "
+                        f"старый тикет {existing_thread.ticket_id} → новый тикет {ticket.id}"
+                    )
+
+                    # Чистим кеш старого тикета
+                    await cache.invalidate_ticket_threads(existing_thread.ticket_id)
+
+                    # Привязываем к новому тикету
+                    existing_thread.ticket_id = ticket.id
+
+                # Обновляем название
                 existing_thread.tech_thread_name = tech_title
                 await db.flush()
 
-                # Переоткрываем
+                # Переоткрываем топик
                 await _reopen_tech_topic(
                     bot,
                     existing_thread.tech_chat_id,
                     tech_thread_id,
                 )
 
-                # Переименовываем
+                # Переименовываем топик
                 try:
                     await bot.edit_forum_topic(
                         chat_id=existing_thread.tech_chat_id,
@@ -1214,9 +1225,39 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                     f"♻️ Переиспользован топик {tech_thread_id} "
                     f"для клиента {ticket.client_tg_id} и техника {tech.id}"
                 )
-                
-                # ✅ История уже есть в старом топике - ничего не копируем
 
+                # ----------------------------------------------
+                # 📋 Копирование истории — только если тикет новый!
+                # ----------------------------------------------
+                if not is_same_ticket:
+                    logger.info(
+                        f"📋 Копируем историю нового тикета #{ticket.id} "
+                        f"в переиспользованный топик #{tech_thread_id}"
+                    )
+
+                    stmt_with_messages = (
+                        select(Ticket)
+                        .options(
+                            selectinload(Ticket.client),
+                            selectinload(Ticket.messages),
+                        )
+                        .where(Ticket.id == ticket.id)
+                    )
+                    result = await db.execute(stmt_with_messages)
+                    ticket_with_messages = result.scalar_one_or_none()
+
+                    if ticket_with_messages:
+                        copied = await _copy_ticket_history_to_tech(
+                            bot=bot,
+                            ticket=ticket_with_messages,
+                            tech_chat_id=existing_thread.tech_chat_id,
+                            tech_thread_id=tech_thread_id,
+                            db=db,
+                        )
+                        logger.info(
+                            f"📨 История переслана ({copied} сообщений) "
+                            f"в переиспользованный тех-топик"
+                        )
             else:
                 # ========================================
                 # Путь Б: Создаём новый топик

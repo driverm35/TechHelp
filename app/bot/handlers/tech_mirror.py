@@ -121,56 +121,58 @@ async def _send_feedback_poll(bot: Bot, ticket_id: int, client_tg_id: int, tech_
 
 
 async def send_feedback_button_handler(call: CallbackQuery, bot: Bot) -> None:
+    """Обработка нажатия кнопки 'Отправить опрос'."""
     logger.info(f"🔧 send_feedback_button_handler: data={call.data}, user={call.from_user.id}")
-    ticket_id_str = call.data.split(":", maxsplit=1)[1]
+    
+    # Парсим ticket_id из callback_data
+    try:
+        _, ticket_id_str = call.data.split(":", maxsplit=1)
+        ticket_id = int(ticket_id_str)
+    except (ValueError, IndexError) as e:
+        logger.error(f"❌ Ошибка парсинга callback_data: {e}")
+        await call.answer("❌ Некорректные данные", show_alert=True)
+        return
 
     async with db_manager.session() as db:
-
-        # 3. Ищем тех-топик
-        tech_thread = await _get_tech_thread_by_location(
-            db,
-            call.chat.id,
-            call.message_thread_id
-        )
-
-        if not tech_thread:
-            await call.reply("❌ Этот топик не связан с тикетом")
-            return
-
-        # 4. Получаем тикет с клиентом
-        ticket = await _get_ticket_with_client(db, tech_thread.ticket_id)
-
-        if not ticket:
-            await call.reply("❌ Тикет не найден", parse_mode="HTML")
-            return
-
-        if not ticket.client:
-            await call.reply("❌ У тикета нет клиента", parse_mode="HTML")
-            return
-
-        # 5. Проверка: тикет должен быть закрыт
-        if ticket.status != TicketStatus.CLOSED:
-            await call.reply(
-                "⚠️ Опрос можно отправить только для <b>закрытого</b> тикета.",
-                parse_mode="HTML"
-            )
-            return
-
-        # 6. Проверка на повторную отправку опроса
-        #    Чтобы не спамить клиенту
-        feedback_key = f"feedback_sent:{ticket.id}"
-        from app.utils.cache import cache
-
-        already = await cache.get(feedback_key)
-        if already:
-            await call.reply(
-                "ℹ️ Опрос уже был отправлен ранее.",
-                parse_mode="HTML"
-            )
-            return
-
-        # 7. Отправляем опрос
         try:
+            # Получаем тикет с клиентом
+            stmt = (
+                select(Ticket)
+                .options(selectinload(Ticket.client))
+                .where(Ticket.id == ticket_id)
+            )
+            result = await db.execute(stmt)
+            ticket = result.scalar_one_or_none()
+
+            if not ticket:
+                await call.answer("❌ Тикет не найден", show_alert=True)
+                return
+
+            if not ticket.client:
+                await call.answer("❌ У тикета нет клиента", show_alert=True)
+                return
+
+            # Проверка: тикет должен быть закрыт
+            if ticket.status != TicketStatus.CLOSED:
+                await call.answer(
+                    "⚠️ Опрос можно отправить только для закрытого тикета.",
+                    show_alert=True
+                )
+                return
+
+            # Проверка на повторную отправку опроса
+            feedback_key = f"feedback_sent:{ticket.id}"
+            from app.utils.cache import cache
+
+            already = await cache.get(feedback_key)
+            if already:
+                await call.answer(
+                    "ℹ️ Опрос уже был отправлен ранее.",
+                    show_alert=True
+                )
+                return
+
+            # Отправляем опрос
             await _send_feedback_poll(
                 bot=bot,
                 ticket_id=ticket.id,
@@ -181,17 +183,23 @@ async def send_feedback_button_handler(call: CallbackQuery, bot: Bot) -> None:
             # Запоминаем факт отправки (TTL = 7 дней)
             await cache.set(feedback_key, True, ttl=7*24*3600)
 
-            await call.reply("📨 Опрос отправлен клиенту.", parse_mode="HTML")
+            await call.answer("✅ Опрос отправлен клиенту")
+            
+            # Отправляем сообщение в топик для подтверждения
+            try:
+                await call.message.reply(
+                    "📨 Опрос успешно отправлен клиенту.",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
 
         except Exception as e:
-            logger.error(f"❌ Ошибка отправки опроса вручную: {e}")
-            await call.reply(
+            logger.error(f"❌ Ошибка отправки опроса: {e}", exc_info=True)
+            await call.answer(
                 "❌ Ошибка при отправке опроса.",
-                parse_mode="HTML"
+                show_alert=True
             )
-
-    # Не отвечаем в tech-topic
-    return
 
 # ─────────────────────────────────────────────
 #  Зеркалирование сообщений из группы техника
@@ -907,9 +915,9 @@ def register_handlers(dp: Dispatcher) -> None:
         F.message_thread_id,
     )
     # Кнопка отправки опроса
-    dp.message.register(
+    dp.callback_query.register(
         send_feedback_button_handler,
-        F.data.startswith("send_feedback_button"),
+        F.data.startswith("send_feedback_button:"),
     )
 
     # Зеркалирование обычных сообщений

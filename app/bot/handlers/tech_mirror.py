@@ -1,9 +1,14 @@
 # app/bot/handlers/tech_mirror.py
 from __future__ import annotations
 import logging
+import asyncio
 
 from aiogram import Dispatcher, F, Bot
 from aiogram.enums import ChatType
+from aiogram.exceptions import (
+    TelegramRetryAfter,
+    TelegramBadRequest,
+)
 from aiogram.filters import Command
 from aiogram.types import Message, InlineQuery, InlineQueryResultArticle, InputTextMessageContent, CallbackQuery
 from sqlalchemy import select
@@ -25,6 +30,123 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 #  Вспомогательные функции
 # ─────────────────────────────────────────────
+
+async def _copy_message_direct(
+    bot: Bot,
+    source_message: Message,
+    target_chat_id: int,
+    target_thread_id: int | None = None,
+) -> bool:
+    """
+    Копирует сообщение напрямую (без очереди).
+    
+    Args:
+        bot: Экземпляр бота
+        source_message: Исходное сообщение
+        target_chat_id: ID целевого чата
+        target_thread_id: ID целевого топика (опционально)
+        
+    Returns:
+        True если успешно
+    """
+    kwargs = {}
+    if target_thread_id:
+        kwargs["message_thread_id"] = target_thread_id
+
+    try:
+        if source_message.photo:
+            await bot.send_photo(
+                chat_id=target_chat_id,
+                photo=source_message.photo[-1].file_id,
+                caption=source_message.caption,
+                parse_mode="HTML",
+                **kwargs
+            )
+        elif source_message.video:
+            await bot.send_video(
+                chat_id=target_chat_id,
+                video=source_message.video.file_id,
+                caption=source_message.caption,
+                parse_mode="HTML",
+                **kwargs
+            )
+        elif source_message.document:
+            await bot.send_document(
+                chat_id=target_chat_id,
+                document=source_message.document.file_id,
+                caption=source_message.caption,
+                parse_mode="HTML",
+                **kwargs
+            )
+        elif source_message.voice:
+            await bot.send_voice(
+                chat_id=target_chat_id,
+                voice=source_message.voice.file_id,
+                caption=source_message.caption,
+                parse_mode="HTML",
+                **kwargs
+            )
+        elif source_message.audio:
+            await bot.send_audio(
+                chat_id=target_chat_id,
+                audio=source_message.audio.file_id,
+                caption=source_message.caption,
+                parse_mode="HTML",
+                **kwargs
+            )
+        elif source_message.video_note:
+            await bot.send_video_note(
+                chat_id=target_chat_id,
+                video_note=source_message.video_note.file_id,
+                **kwargs
+            )
+        else:
+            # Текст
+            text = source_message.text or source_message.caption or "[медиа]"
+            await bot.send_message(
+                chat_id=target_chat_id,
+                text=text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                **kwargs
+            )
+        
+        return True
+
+    except TelegramRetryAfter as e:
+        logger.warning(f"⏳ 429: ждём {e.retry_after}s")
+        await asyncio.sleep(e.retry_after)
+        
+        # Повторная попытка
+        try:
+            if source_message.photo:
+                await bot.send_photo(chat_id=target_chat_id, photo=source_message.photo[-1].file_id, caption=source_message.caption, parse_mode="HTML", **kwargs)
+            elif source_message.video:
+                await bot.send_video(chat_id=target_chat_id, video=source_message.video.file_id, caption=source_message.caption, parse_mode="HTML", **kwargs)
+            elif source_message.document:
+                await bot.send_document(chat_id=target_chat_id, document=source_message.document.file_id, caption=source_message.caption, parse_mode="HTML", **kwargs)
+            elif source_message.voice:
+                await bot.send_voice(chat_id=target_chat_id, voice=source_message.voice.file_id, caption=source_message.caption, parse_mode="HTML", **kwargs)
+            elif source_message.audio:
+                await bot.send_audio(chat_id=target_chat_id, audio=source_message.audio.file_id, caption=source_message.caption, parse_mode="HTML", **kwargs)
+            elif source_message.video_note:
+                await bot.send_video_note(chat_id=target_chat_id, video_note=source_message.video_note.file_id, **kwargs)
+            else:
+                text = source_message.text or source_message.caption or "[медиа]"
+                await bot.send_message(chat_id=target_chat_id, text=text, parse_mode="HTML", disable_web_page_preview=True, **kwargs)
+            return True
+        except Exception as retry_error:
+            logger.error(f"❌ Повторная отправка провалилась: {retry_error}")
+            return False
+
+    except TelegramBadRequest as e:
+        logger.error(f"❌ BadRequest при копировании: {e}")
+        return False
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка копирования: {e}", exc_info=True)
+        return False
+    
 
 async def _pin_message_in_topic(
     bot: Bot,
@@ -183,7 +305,7 @@ async def send_feedback_button_handler(call: CallbackQuery, bot: Bot) -> None:
             # Запоминаем факт отправки (TTL = 7 дней)
             await cache.set(feedback_key, True, ttl=7*24*3600)
 
-            await call.answer("✅ Опрос отправлен клиенту", show_alert=True)
+            await call.answer("✅ Опрос отправлен клиенту")
             
             # Отправляем сообщение в топик для подтверждения
             try:
@@ -211,11 +333,14 @@ async def handle_tech_group_message(message: Message, bot: Bot) -> None:
     if not message.message_thread_id:
         return
 
-    # Игнорируем служебные
+    # Игнорируем и удаляем служебные
     if any([
         message.forum_topic_created,
         message.forum_topic_closed,
         message.forum_topic_edited,
+        message.forum_topic_reopened,
+        message.general_forum_topic_hidden,
+        message.general_forum_topic_unhidden,
         message.new_chat_members,
         message.left_chat_member,
         message.new_chat_title,
@@ -227,14 +352,23 @@ async def handle_tech_group_message(message: Message, bot: Bot) -> None:
         message.migrate_to_chat_id,
         message.migrate_from_chat_id,
         message.pinned_message,
+        message.message_auto_delete_timer_changed,
+        message.video_chat_scheduled,
+        message.video_chat_started,
+        message.video_chat_ended,
+        message.video_chat_participants_invited,
     ]):
+        try:
+            await message.delete()
+        except Exception:
+            pass
         return
 
     # Проверяем команды
     if message.text and message.text.startswith("/"):
         if message.text.lower().startswith((
-            "/s", "/i", "feed", "/f",
-            "/work", "/done"
+            "/s", "/i", "/feed", "/f",
+            "/work", "/done", "/staff", "/l", "/lead", "/internal"
         )):
             return
         return
@@ -287,6 +421,10 @@ async def handle_tech_group_message(message: Message, bot: Bot) -> None:
         elif message.voice:
             media_type = "voice"
             media_file_id = message.voice.file_id
+        elif message.audio:
+            media_type = "audio"
+            media_file_id = message.audio.file_id
+            media_caption = message.caption
 
         message_text = message.text or message.caption or "[медиа]"
 
@@ -298,33 +436,13 @@ async def handle_tech_group_message(message: Message, bot: Bot) -> None:
             last_name=message.from_user.last_name,
         )
 
-        # Пересылаем в главную группу через Redis
+        # ========================================
+        # 1. Сохраняем в БД
+        # ========================================
         try:
-            main_payload = {
-                "bot_token": bot.token,
-                "type": "text" if not media_type else media_type,
-                "target_chat_id": ticket.main_chat_id,
-                "target_thread_id": ticket.main_thread_id,
-                "ticket_id": ticket.id,
-            }
-            
-            if media_type:
-                main_payload["file_id"] = media_file_id
-                if media_caption:
-                    main_payload["caption"] = media_caption
-            else:
-                main_payload["text"] = message_text
-            
-            await redis_streams.enqueue(main_payload)
-            logger.info(
-                f"✅ Сообщение техника добавлено в очередь для главной группы "
-                f"(топик {ticket.main_thread_id})"
-            )
-            
-            # Сохраняем в БД
             from app.db.crud.message import TicketMessageCRUD
 
-            await TicketMessageCRUD.add_message(
+            msg_record = await TicketMessageCRUD.add_message(
                 session=db,
                 ticket_id=ticket.id,
                 user_id=message.from_user.id,
@@ -335,32 +453,52 @@ async def handle_tech_group_message(message: Message, bot: Bot) -> None:
                 media_caption=media_caption,
                 telegram_message_id=message.message_id,
             )
+            
+            await db.flush()
+            sequence_id = msg_record.id
+            logger.debug(f"📝 Сохранено сообщение техника #{sequence_id}")
 
         except Exception as e:
-            logger.error(f"❌ Ошибка пересылки в главную группу: {e}")
+            logger.error(f"❌ Не удалось сохранить в БД: {e}")
+            return
 
-        # ✅ ИСПРАВЛЕНО: 2. Пересылаем клиенту через Redis
-        try:
-            client_payload = {
-                "bot_token": bot.token,
-                "type": "text" if not media_type else media_type,
-                "target_chat_id": ticket.client_tg_id,
-                "ticket_id": ticket.id,
-            }
-            
-            if media_type:
-                client_payload["file_id"] = media_file_id
-                if media_caption:
-                    client_payload["caption"] = media_caption
-            else:
-                client_payload["text"] = message_text
-            
-            await redis_streams.enqueue(client_payload)
+        # ========================================
+        # 2. ПРЯМОЕ копирование в главную группу
+        # ========================================
+        success = await _copy_message_direct(
+            bot=bot,
+            source_message=message,
+            target_chat_id=ticket.main_chat_id,
+            target_thread_id=ticket.main_thread_id,
+        )
+        
+        if success:
             logger.info(
-                f"✅ Сообщение техника добавлено в очередь для клиента {ticket.client_tg_id}"
+                f"✅ Сообщение техника #{sequence_id} скопировано в главную группу "
+                f"(топик {ticket.main_thread_id})"
             )
-        except Exception as e:
-            logger.error(f"❌ Ошибка пересылки клиенту: {e}")
+        else:
+            logger.error(
+                f"❌ Не удалось скопировать сообщение техника #{sequence_id} в главную группу"
+            )
+
+        # ========================================
+        # 3. ПРЯМОЕ копирование клиенту
+        # ========================================
+        success = await _copy_message_direct(
+            bot=bot,
+            source_message=message,
+            target_chat_id=ticket.client_tg_id,
+        )
+        
+        if success:
+            logger.info(
+                f"✅ Сообщение техника #{sequence_id} скопировано клиенту {ticket.client_tg_id}"
+            )
+        else:
+            logger.error(
+                f"❌ Не удалось скопировать сообщение техника #{sequence_id} клиенту"
+            )
 
 
 # ─────────────────────────────────────────────
@@ -871,6 +1009,10 @@ async def inline_query_handler(inline_query: InlineQuery) -> None:
 #  Регистрация обработчиков
 # ─────────────────────────────────────────────
 
+# ─────────────────────────────────────────────
+#  Регистрация обработчиков
+# ─────────────────────────────────────────────
+
 def register_handlers(dp: Dispatcher) -> None:
     """Регистрация обработчиков для зеркалирования из групп техников."""
     logger.info("🔧 === НАЧАЛО регистрации обработчиков tech_mirror.py ===")
@@ -892,6 +1034,7 @@ def register_handlers(dp: Dispatcher) -> None:
         F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
         F.message_thread_id,
     )
+    
     # Команда отправки опроса
     dp.message.register(
         cmd_feedback,
@@ -914,6 +1057,7 @@ def register_handlers(dp: Dispatcher) -> None:
         F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
         F.message_thread_id,
     )
+    
     # Кнопка отправки опроса
     dp.callback_query.register(
         send_feedback_button_handler,
@@ -921,13 +1065,12 @@ def register_handlers(dp: Dispatcher) -> None:
     )
 
     # Зеркалирование обычных сообщений
-    # Важно: НЕ из главной группы
     dp.message.register(
         handle_tech_group_message,
         F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
         F.chat.id != settings.main_group_id,
         F.message_thread_id,
-        F.text | F.photo | F.video | F.document | F.voice,
+        F.text | F.photo | F.video | F.document | F.voice | F.audio,
     )
 
     logger.info("✅ Зарегистрированы обработчики для зеркалирования из групп техников")

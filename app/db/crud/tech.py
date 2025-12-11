@@ -413,13 +413,39 @@ async def find_existing_tech_topic_for_client(
     current_ticket_id: int
 ) -> Tuple[Optional[TechThread], bool]:
     """
-    Находит последний тех-топик для пары (client, technician)
-    и сообщает, относится ли он к текущему тикету.
+    Расширенный поиск тех-топика:
 
-    Returns:
-        (existing_thread, is_same_ticket)
+    1) Сначала ищем топик ПОД ЭТОТ ТИКЕТ (идеальный сценарий).
+    2) Если нет — ищем последний топик клиента у этого техника.
     """
-    stmt = (
+
+    # ---------------------------------------------------------
+    # 1) Пытаемся найти топик, созданный именно под current_ticket_id
+    # ---------------------------------------------------------
+    stmt_exact = (
+        select(TechThread)
+        .where(
+            TechThread.user_id == client_tg_id,
+            TechThread.tech_id == tech_id,
+            TechThread.ticket_id == current_ticket_id
+        )
+        .order_by(TechThread.id.desc())
+        .limit(1)
+    )
+    res_exact = await session.execute(stmt_exact)
+    exact_thread = res_exact.scalar_one_or_none()
+
+    if exact_thread:
+        logger.info(
+            "🔍 Найден ТОЧНЫЙ топик #%s (ticket=%s) для клиента %s и техника %s",
+            exact_thread.tech_thread_id, current_ticket_id, client_tg_id, tech_id
+        )
+        return exact_thread, True
+
+    # ---------------------------------------------------------
+    # 2) Нет точного — ищем последний топик техника с этим клиентом
+    # ---------------------------------------------------------
+    stmt_last = (
         select(TechThread)
         .where(
             TechThread.user_id == client_tg_id,
@@ -428,15 +454,25 @@ async def find_existing_tech_topic_for_client(
         .order_by(TechThread.id.desc())
         .limit(1)
     )
-    res = await session.execute(stmt)
-    thread = res.scalar_one_or_none()
+    res_last = await session.execute(stmt_last)
+    last_thread = res_last.scalar_one_or_none()
 
-    if thread:
+    if last_thread:
         logger.info(
-            "🔍 Найден топик #%s для клиента %s и техника %s (ticket_id=%s, current=%s)",
-            thread.tech_thread_id, client_tg_id, tech_id, thread.ticket_id, current_ticket_id
+            "🔍 Найден прошлый топик #%s для клиента %s у техника %s (ticket=%s, current=%s)",
+            last_thread.tech_thread_id,
+            client_tg_id,
+            tech_id,
+            last_thread.ticket_id,
+            current_ticket_id
         )
-        return thread, (thread.ticket_id == current_ticket_id)
+        return last_thread, (last_thread.ticket_id == current_ticket_id)
 
-    logger.info("🔍 Топик не найден для клиента %s и техника %s", client_tg_id, tech_id)
+    # ---------------------------------------------------------
+    # 3) Вообще нет топиков
+    # ---------------------------------------------------------
+    logger.info(
+        "🔍 У техника %s нет топиков для клиента %s",
+        tech_id, client_tg_id
+    )
     return None, False

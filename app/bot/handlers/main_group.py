@@ -537,30 +537,14 @@ async def _copy_ticket_history_to_tech(
     db: AsyncSession,
 ) -> int:
     """
-    Копирует историю тикета в топик техника,
-    но НЕ отправляет в Telegram напрямую — только ставит задачи в Redis Streams.
+    Копирует историю тикета в топик техника.
+    Порядок: история → разделитель → шапка клиента → кнопки
     """
 
     copied_count = 0
 
     try:
-        # 1. Заготавливаем шапку клиента
-        header_text = await _get_client_header_text(ticket)
-
-        # Отправляем шапку тоже через очередь
-        await redis_streams.enqueue({
-            "bot_token": bot.token,
-            "type": "text",
-            "text": header_text,
-            "target_chat_id": tech_chat_id,
-            "target_thread_id": tech_thread_id,
-            "pin": False,
-            "attempt": 0
-        })
-
-        logger.info("📨 Шапка клиента отправлена в очередь для топика техника")
-
-        # 2. Получаем историю сообщений
+        # 1. Получаем историю сообщений
         from sqlalchemy import select as sql_select
         from app.db.models import TicketMessage
 
@@ -574,95 +558,95 @@ async def _copy_ticket_history_to_tech(
 
         if not messages:
             logger.info("ℹ️ История сообщений пуста")
-            return copied_count
+            # Даже если пуста - отправим шапку и кнопки в конце
+        else:
+            logger.info(f"📋 История содержит {len(messages)} сообщений")
 
-        logger.info(f"📋 История содержит {len(messages)} сообщений")
+            # 2. Обрабатываем каждое сообщение
+            for msg in messages:
+                try:
+                    text = msg.message_text or ""
+                    text_stripped = text.lstrip()
 
-        # 3. Обрабатываем каждое сообщение
-        for msg in messages:
-            try:
-                text = msg.message_text or ""
-                text_stripped = text.lstrip()
+                    is_staff_note = text_stripped.startswith("💼 ")
+                    is_internal_note = text_stripped.startswith("📝 ")
+                    should_pin = is_staff_note or is_internal_note
 
-                is_staff_note = text_stripped.startswith("💼 ")
-                is_internal_note = text_stripped.startswith("📝 ")
-                should_pin = is_staff_note or is_internal_note
+                    # Формируем отображаемый текст (с префиксами)
+                    if msg.is_from_admin and not should_pin:
+                        prefix = "🛠️ <b>Поддержка:</b>\n"
+                    elif not msg.is_from_admin and not should_pin:
+                        prefix = "👤 <b>Клиент:</b>\n"
+                    else:
+                        prefix = ""
 
-                # Формируем отображаемый текст (с префиксами)
-                if msg.is_from_admin and not should_pin:
-                    prefix = "🛠️ <b>Поддержка:</b>\n"
-                elif not msg.is_from_admin and not should_pin:
-                    prefix = "👤 <b>Клиент:</b>\n"
-                else:
-                    prefix = ""
+                    final_text = f"{prefix}{text}".strip()
 
-                final_text = f"{prefix}{text}".strip()
+                    payload = {
+                        "bot_token": bot.token,
+                        "target_chat_id": tech_chat_id,
+                        "target_thread_id": tech_thread_id,
+                        "attempt": 0,
+                        "pin": False,  # закрепляем только шапку и кнопки
+                    }
 
-                payload = {
-                    "bot_token": bot.token,
-                    "target_chat_id": tech_chat_id,
-                    "target_thread_id": tech_thread_id,
-                    "attempt": 0,
-                    "pin": should_pin,
-                }
+                    # --- Медиа ---
+                    if msg.has_media and msg.media_file_id:
 
-                # --- Медиа ---
-                if msg.has_media and msg.media_file_id:
+                        caption = msg.media_caption or text or ""
+                        caption = f"{prefix}{caption}".strip() if prefix else caption
 
-                    caption = msg.media_caption or text or ""
-                    caption = f"{prefix}{caption}".strip() if prefix else caption
+                        if msg.media_type == "photo":
+                            payload.update({
+                                "type": "photo",
+                                "file_id": msg.media_file_id,
+                                "caption": caption,
+                            })
 
-                    if msg.media_type == "photo":
-                        payload.update({
-                            "type": "photo",
-                            "file_id": msg.media_file_id,
-                            "caption": caption,
-                        })
+                        elif msg.media_type == "video":
+                            payload.update({
+                                "type": "video",
+                                "file_id": msg.media_file_id,
+                                "caption": caption,
+                            })
 
-                    elif msg.media_type == "video":
-                        payload.update({
-                            "type": "video",
-                            "file_id": msg.media_file_id,
-                            "caption": caption,
-                        })
+                        elif msg.media_type == "document":
+                            payload.update({
+                                "type": "document",
+                                "file_id": msg.media_file_id,
+                                "caption": caption,
+                            })
 
-                    elif msg.media_type == "document":
-                        payload.update({
-                            "type": "document",
-                            "file_id": msg.media_file_id,
-                            "caption": caption,
-                        })
+                        elif msg.media_type == "voice":
+                            payload.update({
+                                "type": "voice",
+                                "file_id": msg.media_file_id,
+                                "caption": caption,
+                            })
 
-                    elif msg.media_type == "voice":
-                        payload.update({
-                            "type": "voice",
-                            "file_id": msg.media_file_id,
-                            "caption": caption,
-                        })
+                        else:
+                            # fallback → просто как текст
+                            payload.update({
+                                "type": "text",
+                                "text": final_text
+                            })
 
                     else:
-                        # fallback → просто как текст
+                        # --- Обычный текст ---
                         payload.update({
                             "type": "text",
                             "text": final_text
                         })
 
-                else:
-                    # --- Обычный текст ---
-                    payload.update({
-                        "type": "text",
-                        "text": final_text
-                    })
+                    await redis_streams.enqueue(payload)
+                    copied_count += 1
 
-                await redis_streams.enqueue(payload)
-                copied_count += 1
+                except Exception as e:
+                    logger.error(f"❌ Ошибка упаковки сообщения #{msg.id}: {e}")
 
-            except Exception as e:
-                logger.error(f"❌ Ошибка упаковки сообщения #{msg.id} для воркера: {e}")
+            logger.info(f"✅ В очередь поставлено {copied_count} сообщений истории")
 
-        logger.info(f"✅ В очередь поставлено {copied_count} сообщений истории")
-
-        # 4. Добавляем разделитель — тоже через очередь
+        # 3. Разделитель
         await redis_streams.enqueue({
             "bot_token": bot.token,
             "type": "text",
@@ -672,6 +656,31 @@ async def _copy_ticket_history_to_tech(
             "pin": False,
             "attempt": 0
         })
+
+        # 4. Шапка клиента
+        header_text = await _get_client_header_text(ticket)
+        await redis_streams.enqueue({
+            "bot_token": bot.token,
+            "type": "text",
+            "text": header_text,
+            "target_chat_id": tech_chat_id,
+            "target_thread_id": tech_thread_id,
+            "pin": True,  # закрепляем шапку
+            "attempt": 0
+        })
+
+        # 5. Кнопки управления статусом
+        await redis_streams.enqueue({
+            "bot_token": bot.token,
+            "type": "status_buttons",
+            "ticket_id": ticket.id,
+            "target_chat_id": tech_chat_id,
+            "target_thread_id": tech_thread_id,
+            "pin": True,  # закрепляем кнопки
+            "attempt": 0
+        })
+
+        logger.info("📨 Шапка и кнопки отправлены в очередь (в конце)")
 
     except Exception as e:
         logger.error(f"❌ Ошибка при копировании истории: {e}", exc_info=True)
@@ -1140,18 +1149,39 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                     tech_title,
                 )
                 if not tech_thread_id:
-                    await call.answer("❌ Не удалось создать топик", show_alert=True)
+                    await call.answer(
+                        "❌ Не удалось создать топик",
+                        show_alert=True
+                    )
                     return
-
-                tech_thread = TechThread(
-                    ticket_id=ticket.id,
-                    user_id=ticket.client_tg_id,
-                    tech_id=tech.id,
-                    tech_chat_id=tech.group_chat_id,
-                    tech_thread_id=tech_thread_id,
-                    tech_thread_name=tech_title,
+                # ПРОВЕРЯЕМ: может уже есть TechThread?
+                existing_tech_thread = await db.execute(
+                    select(TechThread).where(
+                        TechThread.ticket_id == ticket.id,
+                        TechThread.tech_id == tech.id
+                    )
                 )
-                db.add(tech_thread)
+                tech_thread_obj = existing_tech_thread.scalar_one_or_none()
+
+
+                if tech_thread_obj:
+                    # Уже есть — обновляем
+                    tech_thread_obj.tech_chat_id = tech.group_chat_id
+                    tech_thread_obj.tech_thread_id = tech_thread_id
+                    tech_thread_obj.tech_thread_name = tech_title
+                    logger.info(f"♻️ Обновлен существующий TechThread для ticket={ticket.id} tech={tech.id}")
+                else:
+                    # Создаём новый
+                    tech_thread = TechThread(
+                        ticket_id=ticket.id,
+                        user_id=ticket.client_tg_id,
+                        tech_id=tech.id,
+                        tech_chat_id=tech.group_chat_id,
+                        tech_thread_id=tech_thread_id,
+                        tech_thread_name=tech_title,
+                    )
+                    db.add(tech_thread)
+    
                 await db.flush()
 
                 # Копируем ВСЮ историю тикета (первичное назначение)
@@ -1254,44 +1284,7 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                         )
                 except Exception as e:
                     logger.error(f"❌ Ошибка копирования истории: {e}")
-
-                # Отправляем кнопки статуса в тех-топик
-                try:
-                    status_kb = InlineKeyboardMarkup(
-                        inline_keyboard=[[
-                            InlineKeyboardButton(
-                                text="🟡 В работе",
-                                callback_data=f"status_work:{ticket.id}",
-                            ),
-                            InlineKeyboardButton(
-                                text="⚪️ Закрыть",
-                                callback_data=f"status_close:{ticket.id}",
-                            ),
-                            InlineKeyboardButton(
-                                text="📊 Отправить опрос",
-                                callback_data=f"send_feedback_button:{ticket.id}",
-                            ),
-                        ]]
-                    )
-                    status_msg = await bot.send_message(
-                        chat_id=tech.group_chat_id,
-                        message_thread_id=tech_thread_id,
-                        text="🎛 <b>Управление статусом:</b>",
-                        reply_markup=status_kb,
-                        parse_mode="HTML",
-                    )
-                    try:
-                        await bot.pin_chat_message(
-                            chat_id=tech.group_chat_id,
-                            message_id=status_msg.message_id,
-                            disable_notification=True,
-                        )
-                        logger.info("📌 Кнопки статусов закреплены")
-                    except Exception as e:
-                        logger.warning(f"⚠️ Не удалось закрепить кнопки статусов: {e}")
-                except Exception as e:
-                    logger.error(f"❌ Ошибка отправки кнопок статусов: {e}")
-
+    
             # 3) Обновляем назначенного техника у тикета
             ticket.assigned_tech_id = tech.id
             await db.commit()

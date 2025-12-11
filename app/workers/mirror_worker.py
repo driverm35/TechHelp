@@ -13,7 +13,7 @@ from aiogram.exceptions import (
     TelegramBadRequest,
     TelegramAPIError,
 )
-
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from app.utils.redis_streams import redis_streams, STREAM_KEY, GROUP
 
 logger = logging.getLogger(__name__)
@@ -94,6 +94,49 @@ async def send_payload(bot: Bot, payload: Dict[str, Any]) -> bool:
                 **kwargs
             )
             await asyncio.sleep(MEDIA_DELAY)
+            return True
+
+        elif msg_type == "status_buttons":
+    
+            ticket_id = payload["ticket_id"]
+    
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[[
+                    InlineKeyboardButton(
+                        text="🟡 В работе",
+                        callback_data=f"status_work:{ticket_id}",
+                    ),
+                    InlineKeyboardButton(
+                        text="⚪️ Закрыть",
+                        callback_data=f"status_close:{ticket_id}",
+                    ),
+                    InlineKeyboardButton(
+                        text="📊 Отправить опрос",
+                        callback_data=f"send_feedback_button:{ticket_id}",
+                    ),
+                ]]
+            )
+
+            msg = await bot.send_message(
+                chat_id=chat_id,
+                text="🎛 <b>Управление статусом:</b>",
+                reply_markup=kb,
+                parse_mode="HTML",
+                **kwargs
+            )
+
+            # Закрепляем если нужно
+            if payload.get("pin"):
+                try:
+                    await bot.pin_chat_message(
+                        chat_id=chat_id,
+                        message_id=msg.message_id,
+                        disable_notification=True,
+                    )
+                except Exception:
+                    pass
+                
+            await asyncio.sleep(TEXT_DELAY)
             return True
 
         else:

@@ -799,27 +799,10 @@ async def handle_main_group_message(message: Message, bot: Bot) -> None:
             last_name=message.from_user.last_name,
         )
 
-        # Отправка клиенту через Redis Streams
+        # ========================================
+        # 1. Сохраняем в БД СНАЧАЛА
+        # ========================================
         try:
-            payload = {
-                "bot_token": bot.token,  
-                "type": "text" if not media_type else media_type,
-                "target_chat_id": ticket.client_tg_id,
-                "ticket_id": ticket.id,
-                "sequence_id": msg_record.id,
-            }
-            
-            if media_type:
-                payload["file_id"] = media_file_id
-                if media_caption:
-                    payload["caption"] = media_caption
-            else:
-                payload["text"] = message_text
-            
-            await redis_streams.enqueue(payload)
-            logger.info(f"✅ Сообщение добавлено в очередь для клиента {ticket.client_tg_id}")
-
-            # Сохраняем в БД
             from app.db.crud.message import TicketMessageCRUD
 
             msg_record = await TicketMessageCRUD.add_message(
@@ -833,11 +816,45 @@ async def handle_main_group_message(message: Message, bot: Bot) -> None:
                 media_caption=media_caption,
                 telegram_message_id=message.message_id,
             )
+            
+            # Важно: flush чтобы получить ID
+            await db.flush()
+            
+            sequence_id = msg_record.id
+            logger.debug(f"📝 Сохранено сообщение #{sequence_id}")
+
+        except Exception as e:
+            logger.error(f"❌ Не удалось сохранить в БД: {e}")
+            return
+
+        # ========================================
+        # 2. Отправка клиенту через Redis Streams
+        # ========================================
+        try:
+            payload = {
+                "bot_token": bot.token,  
+                "type": "text" if not media_type else media_type,
+                "target_chat_id": ticket.client_tg_id,
+                "ticket_id": ticket.id,
+                "sequence_id": sequence_id,  # ✅ Теперь определена
+            }
+            
+            if media_type:
+                payload["file_id"] = media_file_id
+                if media_caption:
+                    payload["caption"] = media_caption
+            else:
+                payload["text"] = message_text
+            
+            await redis_streams.enqueue(payload)
+            logger.info(f"✅ Сообщение seq={sequence_id} добавлено в очередь для клиента {ticket.client_tg_id}")
 
         except Exception as e:
             logger.error(f"❌ Не удалось добавить в очередь для клиента: {e}")
 
-        # Зеркалирование в группу техника
+        # ========================================
+        # 3. Зеркалирование в группу техника
+        # ========================================
         if ticket.assigned_tech_id:
             logger.debug(f"🔍 Попытка зеркалирования: ticket_id={ticket.id} assigned_tech_id={ticket.assigned_tech_id}")
             tech_thread = await _get_tech_thread(db, ticket.id, ticket.assigned_tech_id)
@@ -880,7 +897,7 @@ async def handle_main_group_message(message: Message, bot: Bot) -> None:
                         "target_chat_id": tech_thread.tech_chat_id,
                         "target_thread_id": tech_thread.tech_thread_id,
                         "ticket_id": ticket.id,
-                        "sequence_id": msg_record.id,
+                        "sequence_id": sequence_id,  # ✅ Используем тот же sequence_id
                     }
                     
                     if media_type:
@@ -891,12 +908,11 @@ async def handle_main_group_message(message: Message, bot: Bot) -> None:
                         tech_payload["text"] = message_text
                     
                     await redis_streams.enqueue(tech_payload)
-                    logger.info("✅ Сообщение зеркалировано в группу техника (group=%s thread=%s)", tech_thread.tech_chat_id, tech_thread.tech_thread_id)
+                    logger.info(f"✅ Сообщение seq={sequence_id} зеркалировано в группу техника (group=%s thread=%s)", tech_thread.tech_chat_id, tech_thread.tech_thread_id)
                 except Exception as e:
                     logger.error(f"❌ Не удалось зеркалировать: {e}")
             else:
                 logger.debug(f"ℹ️ TechThread не найден для ticket={ticket.id} tech={ticket.assigned_tech_id}; пропускаем зеркалирование")
-
 # ─────────────────────────────────────────────
 #  Команда /tech
 # ─────────────────────────────────────────────

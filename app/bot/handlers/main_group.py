@@ -1026,7 +1026,7 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
 
     async with db_manager.session() as db:
         try:
-            # Загружаем тикет с клиентом и техником
+            # Загружаем тикет с клиентом
             stmt = (
                 select(Ticket)
                 .options(
@@ -1055,7 +1055,7 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                 )
                 return
 
-            # Если уже стоит техник — ничего не делаем
+            # Если уже стоит этот техник — ничего не делаем
             if ticket.assigned_tech_id == tech_id:
                 await call.answer("✅ Этот техник уже назначен", show_alert=False)
                 return
@@ -1074,7 +1074,9 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                 tech_tag=None,
             )
 
-            # 1) Отключаем зеркалирование от прежнего техника (если был)
+            # ========================================
+            # 1) Удаляем связь со старым техником
+            # ========================================
             if ticket.assigned_tech_id and ticket.assigned_tech_id != tech_id:
                 old_thread = await _get_tech_thread(
                     db,
@@ -1089,11 +1091,12 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                     )
                     await db.delete(old_thread)
                     logger.info(
-                        f"🗑 Удален TechThread для старого техника {ticket.assigned_tech_id} "
-                        f"(тикет #{ticket.id})"
+                        f"🗑 Удален TechThread для старого техника {ticket.assigned_tech_id}"
                     )
 
-            # 2) Ищем существующий топик клиента у этого техника
+            # ========================================
+            # 2) Ищем существующий топик у НОВОГО техника
+            # ========================================
             existing_thread = await find_existing_tech_topic_for_client(
                 db=db,
                 client_tg_id=ticket.client_tg_id,
@@ -1103,21 +1106,24 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
             tech_thread_id = None
 
             if existing_thread:
+                # ========================================
+                # Путь А: Переиспользуем старый топик
+                # ========================================
                 tech_thread_id = existing_thread.tech_thread_id
 
-                # привязываем этот старый топик к новому тикету
+                # Привязываем к текущему тикету
                 existing_thread.ticket_id = ticket.id
                 existing_thread.tech_thread_name = tech_title
                 await db.flush()
 
-                # переоткрываем топик
+                # Переоткрываем
                 await _reopen_tech_topic(
                     bot,
                     existing_thread.tech_chat_id,
                     tech_thread_id,
                 )
 
-                # переименовываем топик
+                # Переименовываем
                 try:
                     await bot.edit_forum_topic(
                         chat_id=existing_thread.tech_chat_id,
@@ -1128,11 +1134,11 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                     pass
                 
                 logger.info(
-                    f"♻️ Используем старый топик {tech_thread_id} "
+                    f"♻️ Переиспользован топик {tech_thread_id} "
                     f"для клиента {ticket.client_tg_id} и техника {tech.id}"
                 )
 
-                # Пересылаем ТОЛЬКО сообщения текущего тикета
+                # Отправляем ТОЛЬКО сообщения текущего тикета
                 await enqueue_ticket_messages_to_tech(
                     db=db,
                     ticket=ticket,
@@ -1142,7 +1148,9 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                 )
 
             else:
-                # Создаём новый топик
+                # ========================================
+                # Путь Б: Создаём новый топик
+                # ========================================
                 tech_thread_id = await _create_tech_topic(
                     bot,
                     tech,
@@ -1150,28 +1158,27 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                 )
                 if not tech_thread_id:
                     await call.answer(
-                        "❌ Не удалось создать топик",
+                        "❌ Не удалось создать топик в группе техника.",
                         show_alert=True
                     )
                     return
-                # ПРОВЕРЯЕМ: может уже есть TechThread?
-                existing_tech_thread = await db.execute(
-                    select(TechThread).where(
-                        TechThread.ticket_id == ticket.id,
-                        TechThread.tech_id == tech.id
-                    )
-                )
-                tech_thread_obj = existing_tech_thread.scalar_one_or_none()
 
+                # Проверяем существование TechThread для этого ticket+tech
+                stmt_check = select(TechThread).where(
+                    TechThread.ticket_id == ticket.id,
+                    TechThread.tech_id == tech.id
+                )
+                existing_record = await db.execute(stmt_check)
+                tech_thread_obj = existing_record.scalar_one_or_none()
 
                 if tech_thread_obj:
-                    # Уже есть — обновляем
+                    # Уже есть запись — обновляем
                     tech_thread_obj.tech_chat_id = tech.group_chat_id
                     tech_thread_obj.tech_thread_id = tech_thread_id
                     tech_thread_obj.tech_thread_name = tech_title
-                    logger.info(f"♻️ Обновлен существующий TechThread для ticket={ticket.id} tech={tech.id}")
+                    logger.info(f"♻️ Обновлен TechThread для ticket={ticket.id} tech={tech.id}")
                 else:
-                    # Создаём новый
+                    # Создаём новую запись
                     tech_thread = TechThread(
                         ticket_id=ticket.id,
                         user_id=ticket.client_tg_id,
@@ -1181,111 +1188,37 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                         tech_thread_name=tech_title,
                     )
                     db.add(tech_thread)
+                    logger.info(f"✅ Создан новый TechThread для ticket={ticket.id} tech={tech.id}")
     
                 await db.flush()
 
-                # Копируем ВСЮ историю тикета (первичное назначение)
-
-                await enqueue_ticket_messages_to_tech(
-                    db=db,
-                    ticket=ticket,
-                    tech_chat_id=tech.group_chat_id,
-                    tech_thread_id=tech_thread_id,
-                    bot_token=bot.token,
+                # Копируем историю через очередь
+                stmt_with_messages = (
+                    select(Ticket)
+                    .options(
+                        selectinload(Ticket.client),
+                        selectinload(Ticket.messages),
+                    )
+                    .where(Ticket.id == ticket.id)
                 )
+                result = await db.execute(stmt_with_messages)
+                ticket_with_messages = result.scalar_one_or_none()
 
-            tech_thread_id: int | None = None
-
-            if existing_thread:
-                # Переиспользуем существующий топик этого техника для этого клиента
-                tech_thread_id = existing_thread.tech_thread_id
-
-                existing_thread.ticket_id = ticket.id
-                # Обновляем название
-                existing_thread.tech_thread_name = tech_title
-                await db.flush()
-
-                # Переоткрываем топик на всякий случай
-                await _reopen_tech_topic(
-                    bot,
-                    existing_thread.tech_chat_id,
-                    tech_thread_id,
-                )
-
-                # Обновляем его название под текущий тикет
-                try:
-                    await bot.edit_forum_topic(
-                        chat_id=existing_thread.tech_chat_id,
-                        message_thread_id=tech_thread_id,
-                        name=tech_title,
+                if ticket_with_messages:
+                    copied = await _copy_ticket_history_to_tech(
+                        bot=bot,
+                        ticket=ticket_with_messages,
+                        tech_chat_id=tech.group_chat_id,
+                        tech_thread_id=tech_thread_id,
+                        db=db,
                     )
                     logger.info(
-                        f"✅ Название существующего топика техника обновлено: {tech_title}"
+                        f"📋 Добавлено в очередь {copied} сообщений истории"
                     )
-                except TelegramBadRequest as e:
-                    logger.warning(f"⚠️ Не удалось обновить название тех-топика: {e}")
-
-                logger.info(
-                    f"♻️ Переиспользован тех-топик {tech_thread_id} "
-                    f"для клиента {ticket.client_tg_id} и техника {tech.id}"
-                )
-            else:
-                # Создаём новый тех-топик
-                tech_thread_id = await _create_tech_topic(
-                    bot,
-                    tech,
-                    tech_title,
-                )
-                if not tech_thread_id:
-                    await call.answer(
-                        "❌ Не удалось создать топик в группе техника.\n"
-                        "Проверьте, что в группе техника включены 'Темы' (форум).",
-                        show_alert=True,
-                    )
-                    return
-
-                # Создаём TechThread с tech_title
-                tech_thread = TechThread(
-                    ticket_id=ticket.id,
-                    user_id=ticket.client_tg_id,
-                    tech_id=tech.id,
-                    tech_chat_id=tech.group_chat_id,
-                    tech_thread_id=tech_thread_id,
-                    tech_thread_name=tech_title,
-                )
-                db.add(tech_thread)
-                await db.flush()
-
-                # Копируем историю тикета в новый тех-топик
-                try:
-                    # Перезагружаем тикет с messages
-                    stmt_with_messages = (
-                        select(Ticket)
-                        .options(
-                            selectinload(Ticket.client),
-                            selectinload(Ticket.messages),
-                        )
-                        .where(Ticket.id == ticket.id)
-                    )
-                    result = await db.execute(stmt_with_messages)
-                    ticket_with_messages = result.scalar_one_or_none()
-
-                    if ticket_with_messages:
-                        copied = await _copy_ticket_history_to_tech(
-                            bot=bot,
-                            ticket=ticket_with_messages,
-                            tech_chat_id=tech.group_chat_id,
-                            tech_thread_id=tech_thread_id,
-                            db=db,
-                        )
-                        logger.info(
-                            f"📋 Добавлено в задачу {copied} сообщений"
-                            f"(тикет #{ticket.id}, техник {tech.id})"
-                        )
-                except Exception as e:
-                    logger.error(f"❌ Ошибка копирования истории: {e}")
     
-            # 3) Обновляем назначенного техника у тикета
+            # ========================================
+            # 3) Обновляем assigned_tech_id
+            # ========================================
             ticket.assigned_tech_id = tech.id
             await db.commit()
 
@@ -1293,14 +1226,18 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                 f"✅ Техник {tech.name} (ID={tech.id}) назначен на тикет #{ticket.id}"
             )
 
-            # 4) Обновляем название ВСЕХ топиков (главный + все тех-топики тикета)
+            # ========================================
+            # 4) Обновляем названия всех топиков
+            # ========================================
             await _update_all_topic_titles(bot, ticket, db)
 
-            # 5) Скрываем клавиатуру выбора техника
+            # ========================================
+            # 5) Скрываем клавиатуру выбора
+            # ========================================
             try:
                 await call.message.edit_reply_markup(reply_markup=None)
             except TelegramBadRequest as e:
-                logger.warning(f"⚠️ Не удалось скрыть клавиатуру /tech: {e}")
+                logger.warning(f"⚠️ Не удалось скрыть клавиатуру: {e}")
 
         except Exception as e:
             logger.error(f"❌ Ошибка при назначении техника: {e}", exc_info=True)
@@ -1319,7 +1256,7 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
             parse_mode="HTML",
         )
     except Exception as e:
-        logger.error(f"Не удалось отправить подтверждение в группу: {e}")
+        logger.error(f"Не удалось отправить подтверждение: {e}")
 
     try:
         await call.answer(f"✅ {tech.name} назначен")

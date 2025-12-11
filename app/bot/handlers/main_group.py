@@ -651,6 +651,7 @@ async def _copy_ticket_history_to_tech(
                         "bot_token": bot.token,
                         "target_chat_id": tech_chat_id,
                         "target_thread_id": tech_thread_id,
+                        "main_thread_id": ticket.main_thread_id,
                         "ticket_id": ticket.id,
                         "sequence_id": msg.id,  # ✅ ID из БД
                         "attempt": 0,
@@ -1044,6 +1045,7 @@ async def enqueue_ticket_messages_to_tech(
             "type": None,
             "target_chat_id": tech_chat_id,
             "target_thread_id": tech_thread_id,
+            "main_thread_id": ticket.main_thread_id,
             "pin": False
         }
 
@@ -1164,24 +1166,24 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                     topic_exists = True
                 except TelegramBadRequest:
                     topic_exists = False
-                
+
                 if not topic_exists:
                     logger.warning(
                         f"⚠️ Техник удалил топик #{existing_thread.tech_thread_id}. "
                         f"Создаём новый топик."
                     )
-                
+
                     # Создаём новый топик
                     tech_thread_id = await _create_tech_topic(bot, tech, tech_title)
-                
+
                     # Обновляем запись в БД
                     existing_thread.tech_thread_id = tech_thread_id
                     existing_thread.ticket_id = ticket.id
                     existing_thread.tech_thread_name = tech_title
                     existing_thread.tech_chat_id = tech.group_chat_id
-                
+
                     await db.flush()
-                
+
                     # Копируем историю текущего тикета
                     stmt_messages = (
                         select(Ticket)
@@ -1190,7 +1192,7 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                     )
                     res = await db.execute(stmt_messages)
                     ticket_with_messages = res.scalar_one_or_none()
-                
+
                     if ticket_with_messages:
                         copied = await _copy_ticket_history_to_tech(
                             bot=bot,
@@ -1200,7 +1202,7 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                             db=db,
                         )
                         logger.info(f"📨 История ({copied}) переслана → новый топик (взамен удалённого)")
-                
+
                     # Переходим к обычной логике обновления
                     existing_thread = None  # чтобы пропустить нижний блок existing_thread
 

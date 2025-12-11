@@ -1167,10 +1167,11 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
             # ============================================================
             # 2) Ищем существующий топик у нового техника (по CLIENT_ID!)
             # ============================================================
-            existing_thread = await find_existing_tech_topic_for_client(
+            existing_thread, is_same_ticket = await find_existing_tech_topic_for_client(
                 session=db,
                 client_tg_id=ticket.client_tg_id,
-                tech_id=tech.id
+                tech_id=tech.id,
+                current_ticket_id=ticket.id
             )
 
             # Если топик найден → проверяем, относится ли он к текущему тикету

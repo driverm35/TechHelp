@@ -909,8 +909,7 @@ def register_handlers(dp: Dispatcher) -> None:
     # Кнопка отправки опроса
     dp.message.register(
         send_feedback_button_handler,
-        F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
-        F.data.startswith("send_feedback_button:"),
+        F.data.startswith("send_feedback_button"),
     )
 
     # Зеркалирование обычных сообщений

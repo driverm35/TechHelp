@@ -1,13 +1,17 @@
 # app/bot/handlers/main_group.py
 
 from __future__ import annotations
+import asyncio
 import logging
 
 from aiogram import Dispatcher, F, Bot
 from aiogram.enums import ChatType
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import (
+    TelegramRetryAfter,
+    TelegramBadRequest,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,9 +21,7 @@ from app.config import settings
 from app.db.database import db_manager
 from app.db.models import Ticket, TechThread, TicketStatus, Technician, User
 from app.db.crud.ticket import (
-    get_all_tech_threads_for_ticket,
-    get_tech_thread_by_user_and_tech,
-    add_event,
+    get_all_tech_threads_for_ticket
     
 )
 from app.db.crud.tech import (
@@ -28,7 +30,6 @@ from app.db.crud.tech import (
     find_existing_tech_topic_for_client
 )
 from app.db.crud.user import get_or_create_user
-from app.db.crud.message import TicketMessageCRUD
 from app.utils.cache import cache
 from app.utils.redis_streams import redis_streams
 
@@ -135,32 +136,6 @@ def _build_topic_title(
         title = title[:125] + "..."
 
     return title
-
-
-def _get_status_control_keyboard(ticket_id: int) -> InlineKeyboardMarkup:
-    """
-    Клавиатура управления статусом тикета.
-
-    Args:
-        ticket_id: ID тикета
-
-    Returns:
-        Клавиатура с кнопками статусов
-    """
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🟡 В работе",
-                    callback_data=f"status_work:{ticket_id}"
-                ),
-                InlineKeyboardButton(
-                    text="⚪️ Закрыть",
-                    callback_data=f"status_close:{ticket_id}"
-                ),
-            ],
-        ]
-    )
 
 
 async def _update_all_topic_titles(
@@ -274,37 +249,6 @@ async def _update_all_topic_titles(
     await db.commit()
 
 
-async def _pin_message_in_topic(
-    bot: Bot,
-    chat_id: int,
-    thread_id: int,
-    message_id: int,
-) -> bool:
-    """
-    Закрепить сообщение в топике.
-
-    Args:
-        bot: Экземпляр бота
-        chat_id: ID чата
-        thread_id: ID топика
-        message_id: ID сообщения
-
-    Returns:
-        True если успешно
-    """
-    try:
-        await bot.pin_chat_message(
-            chat_id=chat_id,
-            message_id=message_id,
-            disable_notification=True,
-        )
-        logger.info(f"📌 Закреплено сообщение {message_id} в топике {thread_id}")
-        return True
-    except TelegramBadRequest as e:
-        logger.warning(f"⚠️ Не удалось закрепить сообщение: {e}")
-        return False
-
-
 async def _get_ticket_by_thread(
     session: AsyncSession,
     chat_id: int,
@@ -360,7 +304,6 @@ async def _get_ticket_by_thread(
     return ticket
 
 
-
 async def _get_tech_thread(
     session: AsyncSession,
     ticket_id: int,
@@ -377,6 +320,7 @@ async def _get_tech_thread(
     res = await session.execute(stmt)
     return res.scalar_one_or_none()
 
+
 async def _reopen_tech_topic(
     bot: Bot,
     tech_chat_id: int,
@@ -392,6 +336,7 @@ async def _reopen_tech_topic(
     except TelegramBadRequest as e:
         # Если уже открыт — Телеграм может вернуть ошибку, логируем как debug
         logger.debug(f"ℹ️ Не удалось переоткрыть топик {tech_thread_id}: {e}")
+
 
 async def _close_tech_topic(
     bot: Bot,
@@ -444,6 +389,7 @@ async def _create_tech_topic(
     except TelegramBadRequest as e:
         logger.error(f"❌ Не удалось создать топик: {e}")
         return None
+
 
 async def _get_client_header_text(ticket: Ticket) -> str:
     """
@@ -528,6 +474,123 @@ async def _get_client_header_text(ticket: Ticket) -> str:
 
     return "\n".join(lines)
 
+
+async def _copy_message_direct(
+    bot: Bot,
+    source_message: Message,
+    target_chat_id: int,
+    target_thread_id: int | None = None,
+) -> bool:
+    """
+    Копирует сообщение напрямую (без очереди).
+    
+    Args:
+        bot: Экземпляр бота
+        source_message: Исходное сообщение
+        target_chat_id: ID целевого чата
+        target_thread_id: ID целевого топика (опционально)
+        
+    Returns:
+        True если успешно
+    """
+    kwargs = {}
+    if target_thread_id:
+        kwargs["message_thread_id"] = target_thread_id
+
+    try:
+        if source_message.photo:
+            await bot.send_photo(
+                chat_id=target_chat_id,
+                photo=source_message.photo[-1].file_id,
+                caption=source_message.caption,
+                parse_mode="HTML",
+                **kwargs
+            )
+        elif source_message.video:
+            await bot.send_video(
+                chat_id=target_chat_id,
+                video=source_message.video.file_id,
+                caption=source_message.caption,
+                parse_mode="HTML",
+                **kwargs
+            )
+        elif source_message.document:
+            await bot.send_document(
+                chat_id=target_chat_id,
+                document=source_message.document.file_id,
+                caption=source_message.caption,
+                parse_mode="HTML",
+                **kwargs
+            )
+        elif source_message.voice:
+            await bot.send_voice(
+                chat_id=target_chat_id,
+                voice=source_message.voice.file_id,
+                caption=source_message.caption,
+                parse_mode="HTML",
+                **kwargs
+            )
+        elif source_message.audio:
+            await bot.send_audio(
+                chat_id=target_chat_id,
+                audio=source_message.audio.file_id,
+                caption=source_message.caption,
+                parse_mode="HTML",
+                **kwargs
+            )
+        elif source_message.video_note:
+            await bot.send_video_note(
+                chat_id=target_chat_id,
+                video_note=source_message.video_note.file_id,
+                **kwargs
+            )
+        else:
+            # Текст
+            text = source_message.text or source_message.caption or "[медиа]"
+            await bot.send_message(
+                chat_id=target_chat_id,
+                text=text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                **kwargs
+            )
+        
+        return True
+
+    except TelegramRetryAfter as e:
+        logger.warning(f"⏳ 429: ждём {e.retry_after}s")
+        await asyncio.sleep(e.retry_after)
+        
+        # Повторная попытка
+        try:
+            if source_message.photo:
+                await bot.send_photo(chat_id=target_chat_id, photo=source_message.photo[-1].file_id, caption=source_message.caption, parse_mode="HTML", **kwargs)
+            elif source_message.video:
+                await bot.send_video(chat_id=target_chat_id, video=source_message.video.file_id, caption=source_message.caption, parse_mode="HTML", **kwargs)
+            elif source_message.document:
+                await bot.send_document(chat_id=target_chat_id, document=source_message.document.file_id, caption=source_message.caption, parse_mode="HTML", **kwargs)
+            elif source_message.voice:
+                await bot.send_voice(chat_id=target_chat_id, voice=source_message.voice.file_id, caption=source_message.caption, parse_mode="HTML", **kwargs)
+            elif source_message.audio:
+                await bot.send_audio(chat_id=target_chat_id, audio=source_message.audio.file_id, caption=source_message.caption, parse_mode="HTML", **kwargs)
+            elif source_message.video_note:
+                await bot.send_video_note(chat_id=target_chat_id, video_note=source_message.video_note.file_id, **kwargs)
+            else:
+                text = source_message.text or source_message.caption or "[медиа]"
+                await bot.send_message(chat_id=target_chat_id, text=text, parse_mode="HTML", disable_web_page_preview=True, **kwargs)
+            return True
+        except Exception as retry_error:
+            logger.error(f"❌ Повторная отправка провалилась: {retry_error}")
+            return False
+
+    except TelegramBadRequest as e:
+        logger.error(f"❌ BadRequest при копировании: {e}")
+        return False
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка копирования: {e}", exc_info=True)
+        return False
+    
 
 async def _copy_ticket_history_to_tech(
     bot: Bot,
@@ -763,7 +826,7 @@ async def handle_main_group_message(message: Message, bot: Bot) -> None:
             message.chat.id,
             message.message_thread_id
         )
-        logger.info(f"Найден тикет для топика {message.message_thread_id}")
+        
         if not ticket:
             logger.warning(f"⚠️ Тикет не найден для топика {message.message_thread_id}")
             return
@@ -788,6 +851,11 @@ async def handle_main_group_message(message: Message, bot: Bot) -> None:
         elif message.voice:
             media_type = "voice"
             media_file_id = message.voice.file_id
+            media_caption = None
+        elif message.audio:
+            media_type = "audio"
+            media_file_id = message.audio.file_id
+            media_caption = message.caption
 
         message_text = message.text or message.caption or "[медиа]"
         
@@ -800,7 +868,7 @@ async def handle_main_group_message(message: Message, bot: Bot) -> None:
         )
 
         # ========================================
-        # 1. Сохраняем в БД СНАЧАЛА
+        # 1. Сохраняем в БД
         # ========================================
         try:
             from app.db.crud.message import TicketMessageCRUD
@@ -817,9 +885,7 @@ async def handle_main_group_message(message: Message, bot: Bot) -> None:
                 telegram_message_id=message.message_id,
             )
             
-            # Важно: flush чтобы получить ID
             await db.flush()
-            
             sequence_id = msg_record.id
             logger.debug(f"📝 Сохранено сообщение #{sequence_id}")
 
@@ -828,41 +894,28 @@ async def handle_main_group_message(message: Message, bot: Bot) -> None:
             return
 
         # ========================================
-        # 2. Отправка клиенту через Redis Streams
+        # 2. ПРЯМОЕ копирование клиенту
         # ========================================
-        try:
-            payload = {
-                "bot_token": bot.token,  
-                "type": "text" if not media_type else media_type,
-                "target_chat_id": ticket.client_tg_id,
-                "ticket_id": ticket.id,
-                "sequence_id": sequence_id,  # ✅ Теперь определена
-            }
-            
-            if media_type:
-                payload["file_id"] = media_file_id
-                if media_caption:
-                    payload["caption"] = media_caption
-            else:
-                payload["text"] = message_text
-            
-            await redis_streams.enqueue(payload)
-            logger.info(f"✅ Сообщение seq={sequence_id} добавлено в очередь для клиента {ticket.client_tg_id}")
-
-        except Exception as e:
-            logger.error(f"❌ Не удалось добавить в очередь для клиента: {e}")
+        success = await _copy_message_direct(
+            bot=bot,
+            source_message=message,
+            target_chat_id=ticket.client_tg_id,
+        )
+        
+        if success:
+            logger.info(f"✅ Сообщение #{sequence_id} скопировано клиенту {ticket.client_tg_id}")
+        else:
+            logger.error(f"❌ Не удалось скопировать сообщение #{sequence_id} клиенту {ticket.client_tg_id}")
 
         # ========================================
-        # 3. Зеркалирование в группу техника
+        # 3. ПРЯМОЕ копирование в группу техника
         # ========================================
         if ticket.assigned_tech_id:
-            logger.debug(f"🔍 Попытка зеркалирования: ticket_id={ticket.id} assigned_tech_id={ticket.assigned_tech_id}")
             tech_thread = await _get_tech_thread(db, ticket.id, ticket.assigned_tech_id)
 
             if not tech_thread:
                 try:
                     from app.db.crud.ticket import get_tech_thread_by_user_and_tech
-
                     tech_thread = await get_tech_thread_by_user_and_tech(
                         session=db,
                         user_id=ticket.client_tg_id,
@@ -870,49 +923,40 @@ async def handle_main_group_message(message: Message, bot: Bot) -> None:
                     )
                     if tech_thread:
                         logger.info(
-                            "ℹ️ TechThread найден фолбеком по user_id: ticket=%s tech=%s -> group=%s thread=%s",
+                            "ℹ️ TechThread найден фолбеком: ticket=%s tech=%s",
+                            ticket.id,
+                            ticket.assigned_tech_id,
+                        )
+                        await cache.set_tech_thread_by_ticket(
                             ticket.id,
                             ticket.assigned_tech_id,
                             tech_thread.tech_chat_id,
                             tech_thread.tech_thread_id,
                         )
-                        try:
-                            await cache.set_tech_thread_by_ticket(
-                                ticket.id,
-                                ticket.assigned_tech_id,
-                                tech_thread.tech_chat_id,
-                                tech_thread.tech_thread_id,
-                            )
-                        except Exception:
-                            logger.debug("⚠️ Не удалось записать tech_thread в кеш")
                 except Exception as e:
-                    logger.exception("❌ Ошибка при поиске TechThread фолбеком: %s", e)
+                    logger.exception("❌ Ошибка при поиске TechThread: %s", e)
 
             if tech_thread and getattr(tech_thread, 'tech_chat_id', None) and getattr(tech_thread, 'tech_thread_id', None):
-                try:
-                    # Зеркалирование через Redis Streams
-                    tech_payload = {
-                        "bot_token": bot.token,
-                        "type": "text" if not media_type else media_type,
-                        "target_chat_id": tech_thread.tech_chat_id,
-                        "target_thread_id": tech_thread.tech_thread_id,
-                        "ticket_id": ticket.id,
-                        "sequence_id": sequence_id,  # ✅ Используем тот же sequence_id
-                    }
-                    
-                    if media_type:
-                        tech_payload["file_id"] = media_file_id
-                        if media_caption:
-                            tech_payload["caption"] = media_caption
-                    else:
-                        tech_payload["text"] = message_text
-                    
-                    await redis_streams.enqueue(tech_payload)
-                    logger.info(f"✅ Сообщение seq={sequence_id} зеркалировано в группу техника (group=%s thread=%s)", tech_thread.tech_chat_id, tech_thread.tech_thread_id)
-                except Exception as e:
-                    logger.error(f"❌ Не удалось зеркалировать: {e}")
+                success = await _copy_message_direct(
+                    bot=bot,
+                    source_message=message,
+                    target_chat_id=tech_thread.tech_chat_id,
+                    target_thread_id=tech_thread.tech_thread_id,
+                )
+                
+                if success:
+                    logger.info(
+                        f"✅ Сообщение #{sequence_id} скопировано в группу техника "
+                        f"(chat={tech_thread.tech_chat_id} thread={tech_thread.tech_thread_id})"
+                    )
+                else:
+                    logger.error(
+                        f"❌ Не удалось скопировать сообщение #{sequence_id} в группу техника"
+                    )
             else:
-                logger.debug(f"ℹ️ TechThread не найден для ticket={ticket.id} tech={ticket.assigned_tech_id}; пропускаем зеркалирование")
+                logger.debug(
+                    f"ℹ️ TechThread не найден для ticket={ticket.id} tech={ticket.assigned_tech_id}"
+                )
 # ─────────────────────────────────────────────
 #  Команда /tech
 # ─────────────────────────────────────────────
@@ -1170,15 +1214,8 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                     f"♻️ Переиспользован топик {tech_thread_id} "
                     f"для клиента {ticket.client_tg_id} и техника {tech.id}"
                 )
-
-                # Отправляем ТОЛЬКО сообщения текущего тикета
-                await enqueue_ticket_messages_to_tech(
-                    db=db,
-                    ticket=ticket,
-                    tech_chat_id=existing_thread.tech_chat_id,
-                    tech_thread_id=tech_thread_id,
-                    bot_token=bot.token,
-                )
+                
+                # ✅ История уже есть в старом топике - ничего не копируем
 
             else:
                 # ========================================
@@ -1225,7 +1262,9 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
     
                 await db.flush()
 
-                # Копируем историю через очередь
+                # ========================================
+                # Копируем историю ЧЕРЕЗ ВОРКЕР (только для нового топика)
+                # ========================================
                 stmt_with_messages = (
                     select(Ticket)
                     .options(
@@ -1246,7 +1285,8 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                         db=db,
                     )
                     logger.info(
-                        f"📋 Добавлено в очередь {copied} сообщений истории"
+                        f"📋 История из {copied} сообщений добавлена в очередь воркера "
+                        f"(тикет #{ticket.id}, техник {tech.id})"
                     )
     
             # ========================================

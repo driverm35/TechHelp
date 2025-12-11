@@ -183,7 +183,7 @@ async def send_feedback_button_handler(call: CallbackQuery, bot: Bot) -> None:
             # Запоминаем факт отправки (TTL = 7 дней)
             await cache.set(feedback_key, True, ttl=7*24*3600)
 
-            await call.answer("✅ Опрос отправлен клиенту")
+            await call.answer("✅ Опрос отправлен клиенту", show_alert=True)
             
             # Отправляем сообщение в топик для подтверждения
             try:

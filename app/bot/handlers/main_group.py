@@ -652,6 +652,7 @@ async def _copy_ticket_history_to_tech(
                         "bot_token": bot.token,
                         "target_chat_id": tech_chat_id,
                         "target_thread_id": tech_thread_id,
+                        "main_thread_id": ticket.main_thread_id,
                         "ticket_id": ticket.id,
                         "sequence_id": msg.id,  # ✅ ID из БД
                         "attempt": 0,
@@ -723,6 +724,7 @@ async def _copy_ticket_history_to_tech(
             "text": "📍 <b>Конец истории</b>",
             "target_chat_id": tech_chat_id,
             "target_thread_id": tech_thread_id,
+            "main_thread_id": ticket.main_thread_id,
             "ticket_id": ticket.id,
             "sequence_id": last_seq_id + 1,  # Порядок в конце
             "pin": False,
@@ -739,6 +741,7 @@ async def _copy_ticket_history_to_tech(
             "text": header_text,
             "target_chat_id": tech_chat_id,
             "target_thread_id": tech_thread_id,
+            "main_thread_id": ticket.main_thread_id,
             "ticket_id": ticket.id,
             "sequence_id": last_seq_id + 2,  # Порядок в конце
             "pin": True,
@@ -754,6 +757,7 @@ async def _copy_ticket_history_to_tech(
             "ticket_id": ticket.id,
             "target_chat_id": tech_chat_id,
             "target_thread_id": tech_thread_id,
+            "main_thread_id": ticket.main_thread_id,
             "sequence_id": last_seq_id + 3,  # Порядок в конце
             "pin": True,
             "attempt": 0
@@ -1045,6 +1049,7 @@ async def enqueue_ticket_messages_to_tech(
             "type": None,
             "target_chat_id": tech_chat_id,
             "target_thread_id": tech_thread_id,
+            "main_thread_id": ticket.main_thread_id,
             "pin": False
         }
 

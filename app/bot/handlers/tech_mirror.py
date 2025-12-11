@@ -303,7 +303,7 @@ async def send_feedback_button_handler(call: CallbackQuery, bot: Bot) -> None:
             )
 
             # Запоминаем факт отправки (TTL = 7 дней)
-            await cache.set(feedback_key, True, ttl=7*24*3600)
+            await cache.set(feedback_key, True, expire=7*24*3600)
 
             await call.answer("✅ Опрос отправлен клиенту")
             
@@ -829,6 +829,7 @@ async def cmd_work(message: Message, bot: Bot) -> None:
     Команда /work - перевести тикет в работу.
 
     Меняет статус на WORK (🟡) во всех топиках.
+    Обновляет названия топиков даже если статус уже WORK.
     """
     if not message.message_thread_id:
         return
@@ -849,17 +850,15 @@ async def cmd_work(message: Message, bot: Bot) -> None:
         if not ticket:
             return
 
-        if ticket.status == TicketStatus.WORK:
-            await message.reply("✅ Уже в работе")
-            return
+        # Запоминаем предыдущий статус
+        was_already_work = (ticket.status == TicketStatus.WORK)
 
-        # Обновляем статус
+        # Обновляем статус (даже если он уже WORK)
         ticket.status = TicketStatus.WORK
         await db.commit()
 
-        logger.info(f"🟡 Тикет #{ticket.id} переведен в работу")
+        logger.info(f"🟡 Тикет #{ticket.id} {'уже был' if was_already_work else 'переведен'} в работу")
 
-        # Обновляем названия топиков (главный + все тех-топики)
         # Перезагружаем тикет с нужными связями
         stmt = (
             select(Ticket)
@@ -872,10 +871,14 @@ async def cmd_work(message: Message, bot: Bot) -> None:
         result = await db.execute(stmt)
         ticket_reloaded = result.scalar_one_or_none()
 
+        # ВСЕГДА обновляем названия топиков
         if ticket_reloaded:
             await _update_all_topic_titles(bot, ticket_reloaded, db)
 
-        await message.reply("🟡 В работе")
+        if was_already_work:
+            await message.reply("🟡 Статус обновлен (уже в работе)")
+        else:
+            await message.reply("🟡 В работе")
 
 
 async def cmd_done(message: Message, bot: Bot) -> None:
@@ -883,6 +886,7 @@ async def cmd_done(message: Message, bot: Bot) -> None:
     Команда /done - закрыть тикет.
 
     Меняет статус на CLOSED (⚪️) и отправляет опрос клиенту.
+    Обновляет названия топиков даже если статус уже CLOSED.
     """
     if not message.message_thread_id:
         return
@@ -903,17 +907,15 @@ async def cmd_done(message: Message, bot: Bot) -> None:
         if not ticket:
             return
 
-        if ticket.status == TicketStatus.CLOSED:
-            await message.reply("✅ Уже закрыт")
-            return
+        # Запоминаем предыдущий статус
+        was_already_closed = (ticket.status == TicketStatus.CLOSED)
 
-        # Обновляем статус
+        # Обновляем статус (даже если он уже CLOSED)
         ticket.status = TicketStatus.CLOSED
         await db.commit()
 
-        logger.info(f"⚪️ Тикет #{ticket.id} закрыт")
+        logger.info(f"⚪️ Тикет #{ticket.id} {'уже был' if was_already_closed else 'переведен в'} закрыт")
 
-        # Обновляем эмодзи в топиках
         # Перезагружаем тикет с нужными связями
         stmt = (
             select(Ticket)
@@ -926,6 +928,7 @@ async def cmd_done(message: Message, bot: Bot) -> None:
         result = await db.execute(stmt)
         ticket_reloaded = result.scalar_one_or_none()
 
+        # ВСЕГДА обновляем названия топиков
         if ticket_reloaded:
             await _update_all_topic_titles(bot, ticket_reloaded, db)
 
@@ -941,10 +944,16 @@ async def cmd_done(message: Message, bot: Bot) -> None:
                 message_thread_id=message.message_thread_id
             )
 
-            await message.reply("⚪️ Закрыт")
+            if was_already_closed:
+                await message.reply("⚪️ Статус обновлен (уже закрыт)")
+            else:
+                await message.reply("⚪️ Закрыт")
         except Exception as e:
             logger.error(f"❌ Ошибка закрытия топиков: {e}")
-            await message.reply("⚪️ Закрыт")
+            if was_already_closed:
+                await message.reply("⚪️ Статус обновлен (уже закрыт)")
+            else:
+                await message.reply("⚪️ Закрыт")
 
 
 # ─────────────────────────────────────────────

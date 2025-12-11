@@ -1342,7 +1342,8 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
 # ─────────────────────────────────────────────
 
 async def callback_change_status(call: CallbackQuery, bot: Bot) -> None:
-    """Обработка изменения статуса тикета (NEW / WORK / CLOSED).
+    """
+    Обработка изменения статуса тикета (NEW / WORK / CLOSED).
     Даже если статус не меняется — топики обязаны обновиться!
     """
 

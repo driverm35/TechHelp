@@ -1155,6 +1155,55 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
 
             # Если топик найден → проверяем, относится ли он к текущему тикету
             if existing_thread:
+                # Проверяем, существует ли топик в Telegram
+                try:
+                    await bot.get_forum_topic(
+                        chat_id=existing_thread.tech_chat_id,
+                        message_thread_id=existing_thread.tech_thread_id
+                    )
+                    topic_exists = True
+                except TelegramBadRequest:
+                    topic_exists = False
+                
+                if not topic_exists:
+                    logger.warning(
+                        f"⚠️ Техник удалил топик #{existing_thread.tech_thread_id}. "
+                        f"Создаём новый топик."
+                    )
+                
+                    # Создаём новый топик
+                    tech_thread_id = await _create_tech_topic(bot, tech, tech_title)
+                
+                    # Обновляем запись в БД
+                    existing_thread.tech_thread_id = tech_thread_id
+                    existing_thread.ticket_id = ticket.id
+                    existing_thread.tech_thread_name = tech_title
+                    existing_thread.tech_chat_id = tech.group_chat_id
+                
+                    await db.flush()
+                
+                    # Копируем историю текущего тикета
+                    stmt_messages = (
+                        select(Ticket)
+                        .options(selectinload(Ticket.client), selectinload(Ticket.messages))
+                        .where(Ticket.id == ticket.id)
+                    )
+                    res = await db.execute(stmt_messages)
+                    ticket_with_messages = res.scalar_one_or_none()
+                
+                    if ticket_with_messages:
+                        copied = await _copy_ticket_history_to_tech(
+                            bot=bot,
+                            ticket=ticket_with_messages,
+                            tech_chat_id=tech.group_chat_id,
+                            tech_thread_id=tech_thread_id,
+                            db=db,
+                        )
+                        logger.info(f"📨 История ({copied}) переслана → новый топик (взамен удалённого)")
+                
+                    # Переходим к обычной логике обновления
+                    existing_thread = None  # чтобы пропустить нижний блок existing_thread
+
                 tech_thread_id = existing_thread.tech_thread_id
                 is_same_ticket = existing_thread.ticket_id == ticket.id
 

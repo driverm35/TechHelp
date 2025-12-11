@@ -551,16 +551,18 @@ async def _copy_ticket_history_to_tech(
         stmt = (
             sql_select(TicketMessage)
             .where(TicketMessage.ticket_id == ticket.id)
-            .order_by(TicketMessage.created_at)
+            .order_by(TicketMessage.id)  # ✅ ВАЖНО: сортировка по ID, не created_at
         )
         result = await db.execute(stmt)
         messages = result.scalars().all()
 
+        # Определяем последний sequence_id
+        last_seq_id = messages[-1].id if messages else 0
+
         if not messages:
             logger.info("ℹ️ История сообщений пуста")
-            # Даже если пуста - отправим шапку и кнопки в конце
         else:
-            logger.info(f"📋 История содержит {len(messages)} сообщений")
+            logger.info(f"📋 История содержит {len(messages)} сообщений (seq: {messages[0].id} → {last_seq_id})")
 
             # 2. Обрабатываем каждое сообщение
             for msg in messages:
@@ -586,8 +588,10 @@ async def _copy_ticket_history_to_tech(
                         "bot_token": bot.token,
                         "target_chat_id": tech_chat_id,
                         "target_thread_id": tech_thread_id,
+                        "ticket_id": ticket.id,
+                        "sequence_id": msg.id,  # ✅ ID из БД
                         "attempt": 0,
-                        "pin": False,  # закрепляем только шапку и кнопки
+                        "pin": False,
                     }
 
                     # --- Медиа ---
@@ -646,18 +650,24 @@ async def _copy_ticket_history_to_tech(
 
             logger.info(f"✅ В очередь поставлено {copied_count} сообщений истории")
 
-        # 3. Разделитель
+        # ========================================
+        # 3. Разделитель (sequence_id = last + 1)
+        # ========================================
         await redis_streams.enqueue({
             "bot_token": bot.token,
             "type": "text",
             "text": "📍 <b>Конец истории</b>",
             "target_chat_id": tech_chat_id,
             "target_thread_id": tech_thread_id,
+            "ticket_id": ticket.id,
+            "sequence_id": last_seq_id + 1,  # Порядок в конце
             "pin": False,
             "attempt": 0
         })
 
-        # 4. Шапка клиента
+        # ========================================
+        # 4. Шапка клиента (sequence_id = last + 2)
+        # ========================================
         header_text = await _get_client_header_text(ticket)
         await redis_streams.enqueue({
             "bot_token": bot.token,
@@ -665,18 +675,23 @@ async def _copy_ticket_history_to_tech(
             "text": header_text,
             "target_chat_id": tech_chat_id,
             "target_thread_id": tech_thread_id,
-            "pin": True,  # закрепляем шапку
+            "ticket_id": ticket.id,
+            "sequence_id": last_seq_id + 2,  # Порядок в конце
+            "pin": True,
             "attempt": 0
         })
 
-        # 5. Кнопки управления статусом
+        # ========================================
+        # 5. Кнопки (sequence_id = last + 3)
+        # ========================================
         await redis_streams.enqueue({
             "bot_token": bot.token,
             "type": "status_buttons",
             "ticket_id": ticket.id,
             "target_chat_id": tech_chat_id,
             "target_thread_id": tech_thread_id,
-            "pin": True,  # закрепляем кнопки
+            "sequence_id": last_seq_id + 3,  # Порядок в конце
+            "pin": True,
             "attempt": 0
         })
 
@@ -791,6 +806,7 @@ async def handle_main_group_message(message: Message, bot: Bot) -> None:
                 "type": "text" if not media_type else media_type,
                 "target_chat_id": ticket.client_tg_id,
                 "ticket_id": ticket.id,
+                "sequence_id": msg_record.id,
             }
             
             if media_type:
@@ -806,7 +822,7 @@ async def handle_main_group_message(message: Message, bot: Bot) -> None:
             # Сохраняем в БД
             from app.db.crud.message import TicketMessageCRUD
 
-            await TicketMessageCRUD.add_message(
+            msg_record = await TicketMessageCRUD.add_message(
                 session=db,
                 ticket_id=ticket.id,
                 user_id=message.from_user.id,
@@ -864,6 +880,7 @@ async def handle_main_group_message(message: Message, bot: Bot) -> None:
                         "target_chat_id": tech_thread.tech_chat_id,
                         "target_thread_id": tech_thread.tech_thread_id,
                         "ticket_id": ticket.id,
+                        "sequence_id": msg_record.id,
                     }
                     
                     if media_type:

@@ -1013,27 +1013,6 @@ async def cmd_tech(message: Message, bot: Bot) -> None:
     )
 
 
-async def find_existing_tech_topic_for_client(
-    db: AsyncSession,
-    client_tg_id: int,
-    tech_id: int
-) -> TechThread | None:
-    """
-    Возвращает старый тех-топик этого техника для данного клиента.
-    """
-    stmt = (
-        select(TechThread)
-        .where(
-            TechThread.user_id == client_tg_id,
-            TechThread.tech_id == tech_id
-        )
-        .order_by(TechThread.id.desc())
-        .limit(1)
-    )
-    res = await db.execute(stmt)
-    return res.scalar_one_or_none()
-
-
 async def enqueue_ticket_messages_to_tech(
     db: AsyncSession,
     ticket: Ticket,

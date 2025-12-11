@@ -38,6 +38,8 @@ ticket_stats: Dict[int, Dict[str, Any]] = defaultdict(lambda: {
     "start_time": None,
     "count": 0,
 })
+ticket_in_progress: Dict[int, int | None] = defaultdict(lambda: None)
+
 
 
 # =============================
@@ -332,26 +334,33 @@ async def worker_loop(worker_id: int):
     logger.info(f"🚀 Worker #{worker_id} ЗАПУЩЕН")
 
     last_activity = time.time()
+    ticket_in_progress[worker_id] = None  # воркер пока ничем не занят
 
     await redis_streams.connect()
     await redis_streams.init()
 
     while True:
         try:
-            # WATCHDOG
-            if time.time() - last_activity > WORKER_TIMEOUT:
-                logger.error(f"⛔ Worker #{worker_id} завис >{WORKER_TIMEOUT}s — перезапуск")
-                raise RuntimeError("Worker hang detected")
+            # ----- WATCHDOG -----
+            if ticket_in_progress[worker_id] is not None:  # воркер реально занят тикетом
+                if time.time() - last_activity > WORKER_TIMEOUT:
+                    t_id = ticket_in_progress[worker_id]
+                    logger.error(
+                        f"🔥 Worker #{worker_id} завис на ticket={t_id} >{WORKER_TIMEOUT}s — перезапуск"
+                    )
+                    raise RuntimeError("Worker hang detected")
 
+            # ----- Чтение очереди -----
             resp = await redis_streams.redis.xreadgroup(
                 groupname=GROUP,
                 consumername=consumer_name,
                 streams={STREAM_KEY: ">"},
                 count=1,
-                block=3000
+                block=3000  # 3 сек ожидания
             )
 
             if not resp:
+                # нет задач → воркер НЕ считается зависшим
                 continue
 
             for _, messages in resp:
@@ -365,19 +374,28 @@ async def worker_loop(worker_id: int):
                         await redis_streams.ack(msg_id)
                         continue
 
+                    ticket_id = payload.get("ticket_id")
                     seq = payload.get("sequence_id", "?")
-                    ticket = payload.get("ticket_id")
-                    logger.info(f"📨 Worker #{worker_id}: ticket={ticket} seq={seq}")
+
+                    ticket_in_progress[worker_id] = ticket_id  # воркер начал обработку
+
+                    logger.info(
+                        f"📨 Worker #{worker_id}: ticket={ticket_id} seq={seq}"
+                    )
 
                     ok = await process_message_ordered(msg_id, payload)
 
                     if ok:
                         await redis_streams.ack(msg_id)
-                        logger.info(f"✔ ACK #{worker_id}: seq={seq}")
+                        logger.info(f"✔ ACK worker={worker_id} seq={seq}")
+
+                    ticket_in_progress[worker_id] = None  # воркер свободен
 
         except Exception as e:
             logger.error(f"❌ Ошибка Worker #{worker_id}: {e}", exc_info=True)
+            ticket_in_progress[worker_id] = None  # сбрасываем статус
             await asyncio.sleep(1)
+
 
 
 # =============================

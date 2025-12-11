@@ -115,9 +115,9 @@ async def send_payload(bot: Bot, payload: Dict[str, Any]) -> bool:
                     InlineKeyboardButton(
                         text="⚪️ Закрыть",
                         callback_data=f"status_close:{ticket_id}",
-                    ),
+                    )],[
                     InlineKeyboardButton(
-                        text="📊 Отправить опрос",
+                        text="Отправить опрос",
                         callback_data=f"send_feedback_button:{ticket_id}",
                     ),
                 ]]
@@ -125,7 +125,7 @@ async def send_payload(bot: Bot, payload: Dict[str, Any]) -> bool:
 
             msg = await bot.send_message(
                 chat_id=chat_id,
-                text="🎛 <b>Управление статусом:</b>",
+                text="<b>Управление статусом:</b>",
                 reply_markup=kb,
                 parse_mode="HTML",
                 **kwargs

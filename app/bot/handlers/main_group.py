@@ -639,9 +639,9 @@ async def _copy_ticket_history_to_tech(
 
                     # Формируем отображаемый текст (с префиксами)
                     if msg.is_from_admin and not should_pin:
-                        prefix = "🛠️ <b>Поддержка:</b>\n"
+                        prefix = "🛠️: "
                     elif not msg.is_from_admin and not should_pin:
-                        prefix = "👤 <b>Клиент:</b>\n"
+                        prefix = "👶: "
                     else:
                         prefix = ""
 

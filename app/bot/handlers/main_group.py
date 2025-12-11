@@ -1158,14 +1158,20 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
             # Если топик найден → проверяем, относится ли он к текущему тикету
             if existing_thread:
                 # Проверяем, существует ли топик в Telegram
+                # Проверяем существование топика, пытаясь изменить его название
                 try:
-                    await bot.get_forum_topic(
+                    await bot.edit_forum_topic(
                         chat_id=existing_thread.tech_chat_id,
-                        message_thread_id=existing_thread.tech_thread_id
+                        message_thread_id=existing_thread.tech_thread_id,
+                        name=existing_thread.tech_thread_name or "temp"
                     )
                     topic_exists = True
-                except TelegramBadRequest:
-                    topic_exists = False
+                except TelegramBadRequest as e:
+                    if "TOPIC_NOT_MODIFIED" in str(e):
+                        # Топик существует, просто имя такое же
+                        topic_exists = True
+                    else:
+                        topic_exists = False
 
                 if not topic_exists:
                     logger.warning(

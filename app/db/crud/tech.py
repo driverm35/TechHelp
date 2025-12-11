@@ -1,7 +1,7 @@
 # app/db/crud/tech.py
 from __future__ import annotations
 import logging
-from typing import Sequence, Optional
+from typing import Sequence, Optional, Tuple
 from datetime import datetime, time
 from sqlalchemy import func, select, desc
 from sqlalchemy.exc import IntegrityError
@@ -409,11 +409,15 @@ async def get_or_create_tech_thread(
 async def find_existing_tech_topic_for_client(
     session: AsyncSession,
     client_tg_id: int,
-    tech_id: int
-) -> TechThread | None:
+    tech_id: int,
+    current_ticket_id: int
+) -> Tuple[Optional[TechThread], bool]:
     """
-    Найти последний тех-топик для пары (client, technician).
-    Используется при повторном назначении техники.
+    Находит последний тех-топик для пары (client, technician)
+    и сообщает, относится ли он к текущему тикету.
+
+    Returns:
+        (existing_thread, is_same_ticket)
     """
     stmt = (
         select(TechThread)
@@ -425,4 +429,14 @@ async def find_existing_tech_topic_for_client(
         .limit(1)
     )
     res = await session.execute(stmt)
-    return res.scalar_one_or_none()
+    thread = res.scalar_one_or_none()
+
+    if thread:
+        logger.info(
+            "🔍 Найден топик #%s для клиента %s и техника %s (ticket_id=%s, current=%s)",
+            thread.tech_thread_id, client_tg_id, tech_id, thread.ticket_id, current_ticket_id
+        )
+        return thread, (thread.ticket_id == current_ticket_id)
+
+    logger.info("🔍 Топик не найден для клиента %s и техника %s", client_tg_id, tech_id)
+    return None, False

@@ -5,7 +5,7 @@ import logging
 from aiogram import Dispatcher, F, Bot
 from aiogram.enums import ChatType
 from aiogram.filters import Command
-from aiogram.types import Message, InlineQuery, InlineQueryResultArticle, InputTextMessageContent
+from aiogram.types import Message, InlineQuery, InlineQueryResultArticle, InputTextMessageContent, CallbackQuery
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from aiogram.exceptions import TelegramBadRequest
@@ -120,6 +120,79 @@ async def _send_feedback_poll(bot: Bot, ticket_id: int, client_tg_id: int, tech_
         logger.error(f"❌ Не удалось инициировать опрос: {e}")
 
 
+async def send_feedback_button_handler(call: CallbackQuery, bot: Bot) -> None:
+    logger.info(f"🔧 send_feedback_button_handler: data={call.data}, user={call.from_user.id}")
+    ticket_id_str = call.data.split(":", maxsplit=1)[1]
+
+    async with db_manager.session() as db:
+
+        # 3. Ищем тех-топик
+        tech_thread = await _get_tech_thread_by_location(
+            db,
+            call.chat.id,
+            call.message_thread_id
+        )
+
+        if not tech_thread:
+            await call.reply("❌ Этот топик не связан с тикетом")
+            return
+
+        # 4. Получаем тикет с клиентом
+        ticket = await _get_ticket_with_client(db, tech_thread.ticket_id)
+
+        if not ticket:
+            await call.reply("❌ Тикет не найден", parse_mode="HTML")
+            return
+
+        if not ticket.client:
+            await call.reply("❌ У тикета нет клиента", parse_mode="HTML")
+            return
+
+        # 5. Проверка: тикет должен быть закрыт
+        if ticket.status != TicketStatus.CLOSED:
+            await call.reply(
+                "⚠️ Опрос можно отправить только для <b>закрытого</b> тикета.",
+                parse_mode="HTML"
+            )
+            return
+
+        # 6. Проверка на повторную отправку опроса
+        #    Чтобы не спамить клиенту
+        feedback_key = f"feedback_sent:{ticket.id}"
+        from app.utils.cache import cache
+
+        already = await cache.get(feedback_key)
+        if already:
+            await call.reply(
+                "ℹ️ Опрос уже был отправлен ранее.",
+                parse_mode="HTML"
+            )
+            return
+
+        # 7. Отправляем опрос
+        try:
+            await _send_feedback_poll(
+                bot=bot,
+                ticket_id=ticket.id,
+                client_tg_id=ticket.client_tg_id,
+                tech_id=ticket.assigned_tech_id
+            )
+
+            # Запоминаем факт отправки (TTL = 7 дней)
+            await cache.set(feedback_key, True, ttl=7*24*3600)
+
+            await call.reply("📨 Опрос отправлен клиенту.", parse_mode="HTML")
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки опроса вручную: {e}")
+            await call.reply(
+                "❌ Ошибка при отправке опроса.",
+                parse_mode="HTML"
+            )
+
+    # Не отвечаем в tech-topic
+    return
+
 # ─────────────────────────────────────────────
 #  Зеркалирование сообщений из группы техника
 # ─────────────────────────────────────────────
@@ -217,7 +290,7 @@ async def handle_tech_group_message(message: Message, bot: Bot) -> None:
             last_name=message.from_user.last_name,
         )
 
-        # ✅ ИСПРАВЛЕНО: 1. Пересылаем в главную группу через Redis
+        # Пересылаем в главную группу через Redis
         try:
             main_payload = {
                 "bot_token": bot.token,
@@ -832,6 +905,12 @@ def register_handlers(dp: Dispatcher) -> None:
         Command("done"),
         F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
         F.message_thread_id,
+    )
+    # Кнопка отправки опроса
+    dp.message.register(
+        send_feedback_button_handler,
+        F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
+        F.data.startswith("send_feedback_button:"),
     )
 
     # Зеркалирование обычных сообщений

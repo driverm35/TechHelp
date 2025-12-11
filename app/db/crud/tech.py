@@ -404,3 +404,25 @@ async def get_or_create_tech_thread(
         await session.flush()
 
     return thread
+
+
+async def find_existing_tech_topic_for_client(
+    session: AsyncSession,
+    client_tg_id: int,
+    tech_id: int
+) -> TechThread | None:
+    """
+    Найти последний тех-топик для пары (client, technician).
+    Используется при повторном назначении техники.
+    """
+    stmt = (
+        select(TechThread)
+        .where(
+            TechThread.user_id == client_tg_id,
+            TechThread.tech_id == tech_id
+        )
+        .order_by(TechThread.id.desc())
+        .limit(1)
+    )
+    res = await session.execute(stmt)
+    return res.scalar_one_or_none()

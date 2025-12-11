@@ -20,10 +20,12 @@ from app.db.crud.ticket import (
     get_all_tech_threads_for_ticket,
     get_tech_thread_by_user_and_tech,
     add_event,
+    
 )
 from app.db.crud.tech import (
     get_technicians,
     get_technician_by_id,
+    find_existing_tech_topic_for_client
 )
 from app.db.crud.user import get_or_create_user
 from app.db.crud.message import TicketMessageCRUD
@@ -773,12 +775,12 @@ async def handle_main_group_message(message: Message, bot: Bot) -> None:
             last_name=message.from_user.last_name,
         )
 
-        # ✅ ИСПРАВЛЕНО: Отправка клиенту через Redis Streams
+        # Отправка клиенту через Redis Streams
         try:
             payload = {
-                "bot_token": bot.token,  # ✅ Добавлен токен
-                "type": "text" if not media_type else media_type,  # ✅ Добавлен type
-                "target_chat_id": ticket.client_tg_id,  # ✅ ИСПРАВЛЕНО: был tech_thread
+                "bot_token": bot.token,  
+                "type": "text" if not media_type else media_type,
+                "target_chat_id": ticket.client_tg_id,
                 "ticket_id": ticket.id,
             }
             
@@ -846,7 +848,7 @@ async def handle_main_group_message(message: Message, bot: Bot) -> None:
 
             if tech_thread and getattr(tech_thread, 'tech_chat_id', None) and getattr(tech_thread, 'tech_thread_id', None):
                 try:
-                    # ✅ ИСПРАВЛЕНО: Зеркалирование через Redis Streams
+                    # Зеркалирование через Redis Streams
                     tech_payload = {
                         "bot_token": bot.token,
                         "type": "text" if not media_type else media_type,
@@ -925,12 +927,79 @@ async def cmd_tech(message: Message, bot: Bot) -> None:
     )
 
 
+async def find_existing_tech_topic_for_client(
+    db: AsyncSession,
+    client_tg_id: int,
+    tech_id: int
+) -> TechThread | None:
+    """
+    Возвращает старый тех-топик этого техника для данного клиента.
+    """
+    stmt = (
+        select(TechThread)
+        .where(
+            TechThread.user_id == client_tg_id,
+            TechThread.tech_id == tech_id
+        )
+        .order_by(TechThread.id.desc())
+        .limit(1)
+    )
+    res = await db.execute(stmt)
+    return res.scalar_one_or_none()
+
+
+async def enqueue_ticket_messages_to_tech(
+    db: AsyncSession,
+    ticket: Ticket,
+    tech_chat_id: int,
+    tech_thread_id: int,
+    bot_token: str,
+):
+    """
+    Отправляет в Redis Streams ВСЕ сообщения текущего тикета
+    (НЕ историю старых тикетов этого клиента).
+    """
+    from sqlalchemy import select
+    from app.db.models import TicketMessage
+    from app.utils.redis_streams import redis_streams
+
+    stmt = (
+        select(TicketMessage)
+        .where(TicketMessage.ticket_id == ticket.id)
+        .order_by(TicketMessage.created_at)
+    )
+    result = await db.execute(stmt)
+    messages = result.scalars().all()
+
+    for msg in messages:
+
+        payload = {
+            "bot_token": bot_token,
+            "attempt": 0,
+            "type": None,
+            "target_chat_id": tech_chat_id,
+            "target_thread_id": tech_thread_id,
+            "pin": False
+        }
+
+        # -------- TEXT --------
+        if not msg.has_media:
+            payload["type"] = "text"
+            payload["text"] = msg.message_text or ""
+            await redis_streams.enqueue(payload)
+            continue
+
+        # -------- MEDIA --------
+        payload["file_id"] = msg.media_file_id
+        payload["caption"] = msg.media_caption or msg.message_text or ""
+
+        payload["type"] = msg.media_type  # photo / video / voice / document
+        await redis_streams.enqueue(payload)
+
+
 # ─────────────────────────────────────────────
 #  Callback: назначение техника
 # ─────────────────────────────────────────────
-
-# app/bot/handlers/main_group.py
-
 async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
     """Обработка назначения техника на тикет."""
     if not settings.is_admin(call.from_user.id):
@@ -987,15 +1056,8 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                 await call.answer("❌ Ошибка: клиент не найден.", show_alert=True)
                 return
 
-            client_name = (
-                ticket.client.first_name
-                or ticket.client.username
-                or f"User{ticket.client.tg_id}"
-            )
-            client_username = ticket.client.username
             tag = _extract_consonants(tech.name)
-
-            # ✅ ИСПРАВЛЕНО: Формируем название топика техника (БЕЗ тега)
+          
             tech_title = _build_topic_title(
                 user=ticket.client,
                 status=ticket.status,
@@ -1022,12 +1084,85 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                         f"(тикет #{ticket.id})"
                     )
 
-            # 2) Ищем/создаём тех-топик для НОВОГО техника
-            existing_thread = await get_tech_thread_by_user_and_tech(
+            # 2) Ищем существующий топик клиента у этого техника
+            existing_thread = await find_existing_tech_topic_for_client(
                 session=db,
-                user_id=ticket.client_tg_id,
-                tech_id=tech_id,
+                client_tg_id=ticket.client_tg_id,
+                tech_id=tech.id
             )
+
+            tech_thread_id = None
+
+            if existing_thread:
+                tech_thread_id = existing_thread.tech_thread_id
+
+                # привязываем этот старый топик к новому тикету
+                existing_thread.ticket_id = ticket.id
+                existing_thread.tech_thread_name = tech_title
+                await db.flush()
+
+                # переоткрываем топик
+                await _reopen_tech_topic(
+                    bot,
+                    existing_thread.tech_chat_id,
+                    tech_thread_id,
+                )
+
+                # переименовываем топик
+                try:
+                    await bot.edit_forum_topic(
+                        chat_id=existing_thread.tech_chat_id,
+                        message_thread_id=tech_thread_id,
+                        name=tech_title
+                    )
+                except TelegramBadRequest:
+                    pass
+                
+                logger.info(
+                    f"♻️ Используем старый топик {tech_thread_id} "
+                    f"для клиента {ticket.client_tg_id} и техника {tech.id}"
+                )
+
+                # Пересылаем ТОЛЬКО сообщения текущего тикета
+                await enqueue_ticket_messages_to_tech(
+                    db=db,
+                    ticket=ticket,
+                    tech_chat_id=existing_thread.tech_chat_id,
+                    tech_thread_id=tech_thread_id,
+                    bot_token=bot.token,
+                )
+
+            else:
+                # Создаём новый топик
+                tech_thread_id = await _create_tech_topic(
+                    bot,
+                    tech,
+                    tech_title,
+                )
+                if not tech_thread_id:
+                    await call.answer("❌ Не удалось создать топик", show_alert=True)
+                    return
+
+                tech_thread = TechThread(
+                    ticket_id=ticket.id,
+                    user_id=ticket.client_tg_id,
+                    tech_id=tech.id,
+                    tech_chat_id=tech.group_chat_id,
+                    tech_thread_id=tech_thread_id,
+                    tech_thread_name=tech_title,
+                )
+                db.add(tech_thread)
+                await db.flush()
+
+                # Копируем ВСЮ историю тикета (первичное назначение)
+
+                await enqueue_ticket_messages_to_tech(
+                    db=db,
+                    ticket=ticket,
+                    tech_chat_id=tech.group_chat_id,
+                    tech_thread_id=tech_thread_id,
+                    bot_token=bot.token,
+                )
 
             tech_thread_id: int | None = None
 
@@ -1036,7 +1171,7 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                 tech_thread_id = existing_thread.tech_thread_id
 
                 existing_thread.ticket_id = ticket.id
-                # ✅ ИСПРАВЛЕНО: Обновляем название
+                # Обновляем название
                 existing_thread.tech_thread_name = tech_title
                 await db.flush()
 
@@ -1079,14 +1214,14 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                     )
                     return
 
-                # ✅ ИСПРАВЛЕНО: Создаём TechThread с tech_title
+                # Создаём TechThread с tech_title
                 tech_thread = TechThread(
                     ticket_id=ticket.id,
                     user_id=ticket.client_tg_id,
                     tech_id=tech.id,
                     tech_chat_id=tech.group_chat_id,
                     tech_thread_id=tech_thread_id,
-                    tech_thread_name=tech_title,  # ✅ ДОБАВЛЕНО
+                    tech_thread_name=tech_title,
                 )
                 db.add(tech_thread)
                 await db.flush()
@@ -1114,7 +1249,7 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                             db=db,
                         )
                         logger.info(
-                            f"📋 Скопировано {copied} сообщений в новый топик техника "
+                            f"📋 Добавлено в задачу {copied} сообщений"
                             f"(тикет #{ticket.id}, техник {tech.id})"
                         )
                 except Exception as e:
@@ -1122,8 +1257,6 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
 
                 # Отправляем кнопки статуса в тех-топик
                 try:
-                    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-
                     status_kb = InlineKeyboardMarkup(
                         inline_keyboard=[[
                             InlineKeyboardButton(
@@ -1133,6 +1266,10 @@ async def callback_assign_tech(call: CallbackQuery, bot: Bot) -> None:
                             InlineKeyboardButton(
                                 text="⚪️ Закрыть",
                                 callback_data=f"status_close:{ticket.id}",
+                            ),
+                            InlineKeyboardButton(
+                                text="📊 Отправить опрос",
+                                callback_data=f"send_feedback_button:{ticket.id}",
                             ),
                         ]]
                     )

@@ -1,6 +1,5 @@
 """
-Mirror Worker — строгий FIFO воркер для зеркалирования сообщений.
-ОБЕСПЕЧИВАЕТ НУЛЕВЫЕ 429 за счёт правильных пауз.
+Mirror Worker — 10 параллельных воркеров для зеркалирования сообщений.
 """
 
 import asyncio
@@ -22,8 +21,8 @@ logger = logging.getLogger(__name__)
 # =============================
 # НАСТРОЙКИ
 # =============================
-TEXT_DELAY = 0.05         # 50 мс между текстами
-MEDIA_DELAY = 1.3         # 1.3 сек между медиа
+TEXT_DELAY = 0.05
+MEDIA_DELAY = 1.3
 CONSUMER = "mirror_worker_fifo"
 
 
@@ -31,11 +30,8 @@ CONSUMER = "mirror_worker_fifo"
 # UNIVERSAL TELEGRAM SENDER
 # =============================
 async def send_payload(bot: Bot, payload: Dict[str, Any]) -> bool:
-    """
-    Универсальная отправка сообщения.
-    Возвращает True = OK, False = нужно повторить ту же задачу.
-    """
-
+    """Универсальная отправка. True = OK, False = повторить."""
+    
     msg_type = payload["type"]
     chat_id = payload["target_chat_id"]
     thread_id = payload.get("target_thread_id")
@@ -45,9 +41,6 @@ async def send_payload(bot: Bot, payload: Dict[str, Any]) -> bool:
         kwargs["message_thread_id"] = thread_id
 
     try:
-        # ------------------------------
-        # TEXT
-        # ------------------------------
         if msg_type == "text":
             await bot.send_message(
                 chat_id=chat_id,
@@ -59,9 +52,6 @@ async def send_payload(bot: Bot, payload: Dict[str, Any]) -> bool:
             await asyncio.sleep(TEXT_DELAY)
             return True
 
-        # ------------------------------
-        # MEDIA
-        # ------------------------------
         elif msg_type == "photo":
             await bot.send_photo(
                 chat_id=chat_id,
@@ -107,52 +97,43 @@ async def send_payload(bot: Bot, payload: Dict[str, Any]) -> bool:
             return True
 
         else:
-            logger.error(f"❌ Неизвестный тип сообщения: {msg_type}")
-            return True  # ACK
+            logger.error(f"❌ Неизвестный тип: {msg_type}")
+            return True
 
     except TelegramRetryAfter as e:
-        # Telegram просит подождать → ждем строго retry_after и повторяем
-        logger.warning(f"⏳ 429: Telegram просит подождать {e.retry_after}s — ждём…")
+        logger.warning(f"⏳ 429: ждём {e.retry_after}s")
         await asyncio.sleep(e.retry_after)
-        return False  # НЕ ACK → повторить ту же задачу в воркере
+        return False
 
     except TelegramBadRequest as e:
         logger.error(f"❌ BadRequest: {e}")
-        # 99% это ошибка данных → ACK, не пытаемся ретраить
         return True
 
     except TelegramAPIError as e:
-        logger.error(f"⚠️ Telegram API Error: {e}")
+        logger.error(f"⚠️ API Error: {e}")
         await asyncio.sleep(1)
-        return False  # повторить
+        return False
 
     except Exception as e:
-        logger.error(f"❌ Ошибка send_payload: {e}", exc_info=True)
+        logger.error(f"❌ Ошибка: {e}", exc_info=True)
         await asyncio.sleep(1)
-        return False  # повторить
+        return False
 
 
 # =============================
 # PROCESS MESSAGE
 # =============================
 async def process_message(msg_id: str, payload: Dict[str, Any]) -> bool:
-    """
-    Обрабатывает одну задачу.
-    FIFO гарантируется тем, что:
-    - только один воркер
-    - повтор делается локально (без повторного enqueue)
-    """
+    """Обрабатывает одну задачу с retry."""
     bot = Bot(token=payload["bot_token"])
 
     try:
         while True:
             ok = await send_payload(bot, payload)
-
             if ok:
-                return True  # ACK
-
-            # ok == False → повторяем ту же задачу (429 или временная ошибка)
-            logger.info("🔁 Повторяем задачу после паузы…")
+                return True
+            
+            logger.info("🔁 Повторяем задачу...")
             await asyncio.sleep(0.3)
 
     finally:
@@ -160,10 +141,12 @@ async def process_message(msg_id: str, payload: Dict[str, Any]) -> bool:
 
 
 # =============================
-# MAIN WORKER LOOP (FIFO)
+# WORKER LOOP (один воркер)
 # =============================
-async def worker_loop():
-    logger.info("🚀 FIFO Mirror Worker запущен")
+async def worker_loop(worker_id: int):
+    """Один воркер из пула."""
+    consumer_name = f"{CONSUMER}_{worker_id}"
+    logger.info(f"🚀 Worker #{worker_id} запущен")
 
     await redis_streams.connect()
     await redis_streams.init()
@@ -172,9 +155,9 @@ async def worker_loop():
         try:
             resp = await redis_streams.redis.xreadgroup(
                 groupname=GROUP,
-                consumername=CONSUMER,
+                consumername=consumer_name,
                 streams={STREAM_KEY: ">"},
-                count=1,          # ВАЖНО! FIFO → только одно сообщение за раз
+                count=1,
                 block=3000
             )
 
@@ -183,38 +166,51 @@ async def worker_loop():
 
             for _, messages in resp:
                 for msg_id, raw in messages:
-
-                    # Достаём payload
                     try:
                         payload = json.loads(raw["payload"])
                     except Exception:
-                        logger.error("❌ Плохой payload, делаем ACK")
+                        logger.error(f"❌ Worker {worker_id}: плохой payload")
                         await redis_streams.ack(msg_id)
                         continue
 
-                    logger.info(f"📨 TASK → {payload['type']}")
+                    logger.info(f"📨 Worker {worker_id}: {payload['type']}")
 
                     ok = await process_message(msg_id, payload)
 
                     if ok:
                         await redis_streams.ack(msg_id)
-                        logger.info("✔ ACK")
+                        logger.info(f"✔ Worker {worker_id}: ACK")
 
         except Exception as e:
-            logger.error(f"❌ Worker ERROR: {e}", exc_info=True)
+            logger.error(f"❌ Worker {worker_id}: {e}", exc_info=True)
             await asyncio.sleep(1)
 
 
 # =============================
-# ENTRYPOINT
+# POOL MANAGER
 # =============================
 async def mirror_worker():
+    """Запускает 10 параллельных воркеров."""
+    NUM_WORKERS = 10
+    
+    tasks = []
     try:
-        await worker_loop()
+        for i in range(1, NUM_WORKERS + 1):
+            task = asyncio.create_task(worker_loop(i))
+            tasks.append(task)
+        
+        logger.info(f"🚀 Запущено {NUM_WORKERS} воркеров")
+        await asyncio.gather(*tasks)
+        
     except asyncio.CancelledError:
-        logger.info("⛔ Worker остановлен")
+        logger.info("⛔ Останавливаем воркеры...")
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        
     except Exception as e:
-        logger.error(f"❌ Worker crash: {e}", exc_info=True)
+        logger.error(f"❌ Pool crash: {e}", exc_info=True)
+        
     finally:
         await redis_streams.disconnect()
 

@@ -266,7 +266,7 @@ async def process_message_ordered(msg_id: str, payload: Dict[str, Any]) -> bool:
             bot = Bot(token=payload["bot_token"])
             await bot.send_message(
                 chat_id=payload["target_chat_id"],
-                message_thread_id=payload.get("target_thread_id"),
+                message_thread_id=payload["main_thread_id"],
                 text=f"📤 <b>Начата пересылка истории</b>\nТикет #{ticket_id}",
             )
             await bot.session.close()
@@ -342,7 +342,7 @@ async def process_message_ordered(msg_id: str, payload: Dict[str, Any]) -> bool:
             bot = Bot(token=payload["bot_token"])
             await bot.send_message(
                 chat_id=payload["target_chat_id"],
-                message_thread_id=payload.get("target_thread_id"),
+                message_thread_id=payload["main_thread_id"],
                 text=(
                     f"📬 <b>Пересылка завершена</b>\n"
                     f"Тикет #{ticket_id}\n"
